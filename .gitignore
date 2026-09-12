@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.Python
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+.DS_Store
+sample_receipts/*
+!sample_receipts/.gitkeep
