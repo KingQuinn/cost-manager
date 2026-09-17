@@ -72,12 +72,15 @@ def _is_set(v) -> bool:
     return True
 
 
-def _gemini_model():
+def _gemini_model(model_name: str = "gemini-3.5-flash-lite"):
     """Lazy import + configure Gemini once. Uses gemini-3.5-flash-lite default.
 
     The caller is responsible for ensuring GEMINI_API_KEY is set before the
     first call. If the SDK or key is missing, we raise a clear error rather
     than silently faking output.
+
+    `model_name` is overridable so the same code path can benchmark against
+    gemini-2.5-pro (architecture.md §7.3) without a second implementation.
     """
     try:
         import google.generativeai as genai
@@ -95,9 +98,7 @@ def _gemini_model():
         )
 
     genai.configure(api_key=api_key)
-    # Default per architecture.md §7.3. Swap here (one file) if benchmarking
-    # against gemini-2.5-pro later.
-    return genai.GenerativeModel("gemini-3.5-flash-lite")
+    return genai.GenerativeModel(model_name)
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
@@ -169,7 +170,9 @@ def _coerce_result(raw: dict) -> ExtractionResult:
     )
 
 
-def extract_receipt(image_bytes: bytes, mime_hint: Optional[str] = None) -> ExtractionResult:
+def extract_receipt(
+    image_bytes: bytes, mime_hint: Optional[str] = None, model_name: str = "gemini-3.5-flash-lite"
+) -> ExtractionResult:
     """Run Gemini vision extraction on a receipt image.
 
     All of the "talk to Gemini for extraction" logic lives in this one
@@ -197,7 +200,7 @@ def extract_receipt(image_bytes: bytes, mime_hint: Optional[str] = None) -> Extr
         else:
             mime_hint = "image/jpeg"
 
-    model = _gemini_model()
+    model = _gemini_model(model_name)
 
     import base64
 

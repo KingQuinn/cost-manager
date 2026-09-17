@@ -1,7 +1,7 @@
 # Family expense tracker — architecture and system specification
 
 **Document status:** Living document — update in place as decisions change
-**Version:** 1.2
+**Version:** 1.3
 **Owner:** Khadijah
 **Last updated:** 2026-09-12
 
@@ -12,6 +12,7 @@
 | 1.0 | 2026-08-20 | Initial architecture document |
 | 1.1 | 2026-08-20 | Reframed as an architecture + system specification: added functional requirements, expanded non-functional requirements, endpoint spec, testing strategy, configuration reference, glossary |
 | 1.2 | 2026-09-12 | Webhook handler now parses `value.statuses` (delivery status events), not just `value.messages`, and verifies `X-Hub-Signature-256` when `WHATSAPP_APP_SECRET` is set. Codebase reorganized into a modular `app/` package (routers, services, db layer) — no behavior change to FR-1–FR-7. |
+| 1.3 | 2026-09-12 | Extraction model confirmed: `gemini-3.5-flash-lite` validated against 6 real receipts (build order step 1) — 0.90–0.99 confidence, correct totals every time, zero failures. Planned benchmark against `gemini-2.5-pro` dropped: that model is retired, and its replacement `gemini-3.1-pro-preview` needs paid billing the project doesn't have. Committing to Flash-Lite without the cross-model comparison. |
 
 *Add a row here every time a real decision changes — model swap, schema change, scope change. This document is only useful if it stays truthful.*
 
@@ -199,11 +200,16 @@ can be restarted or scaled without losing in-flight context.
 
 ### 7.3 Gemini Vision API (extraction)
 
-Called once per receipt image. Model choice: `gemini-3.5-flash-lite` by
-default — benchmark against `gemini-2.5-pro` on a sample of real family
-receipts before committing, and step up to Pro only for cases where
-Flash-Lite's accuracy on degraded input (faded thermal print, handwriting)
-is meaningfully worse. See the extraction contract in §9.2.
+Called once per receipt image. Model choice: `gemini-3.5-flash-lite`,
+confirmed — validated on 6 real family receipts (see changelog v1.3):
+0.90–0.99 confidence, correct totals/VAT reconciliation on every one, zero
+parse failures. A cross-model benchmark against a Pro-tier model was
+attempted but dropped: `gemini-2.5-pro` has been retired by Google, and its
+replacement (`gemini-3.1-pro-preview`) requires a paid billing tier the
+project doesn't have enabled (free-tier quota is 0 for that model). Revisit
+if Flash-Lite's accuracy degrades on harder input (faded thermal print,
+handwriting) once more real receipts are seen. See the extraction contract
+in §9.2.
 
 Also used, with a separate short prompt, as the categorization fallback when
 the rules table finds no keyword match (§11).

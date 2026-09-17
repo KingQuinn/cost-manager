@@ -171,12 +171,22 @@ class CapturePipeline:
         cat_by_id = {c.id: c for c in categories}
         lines = [f"✅ Logged {len(items)} item(s) from {receipt.vendor or 'this receipt'}.\n"]
         total = Decimal("0")
+        by_category: dict[str, Decimal] = {}
         for idx, li in enumerate(items, 1):
             cat = cat_by_id.get(li.category_id).name if cat_by_id.get(li.category_id) else "Other"
             lines.append(f"{idx}. {li.name} · {_format_ngn(li.price)} · {cat}")
             total += li.price
+            by_category[cat] = by_category.get(cat, Decimal("0")) + li.price
         lines.append("")
         lines.append(f"Total: {_format_ngn(total)}")
+
+        if len(by_category) > 1:
+            lines.append("")
+            lines.append("By category:")
+            for cat_name, amt in sorted(by_category.items(), key=lambda kv: -kv[1]):
+                pct = int((amt / total * 100).to_integral()) if total else 0
+                lines.append(f"  {cat_name}: {_format_ngn(amt)} ({pct}%)")
+
         lines.append("")
         lines.append("To correct any item, reply e.g. 'item 2 was 2500 and category was Dining'.")
         return "\n".join(lines)
@@ -203,8 +213,82 @@ class CapturePipeline:
         if cl is not None:
             return self._resolve_clarification(member, cl, text, from_phone)
 
-        # 3. Correction against most recent confirmed receipt? e.g. "item 2 price was 1500 category groceries"
+        # 3. A known keyword intent (help / recap / running total)? Checked before
+        # the correction parser since none of these contain an item number.
+        intent_reply = self._handle_known_intent(member, text, from_phone)
+        if intent_reply is not None:
+            return intent_reply
+
+        # 4. Correction against most recent confirmed receipt? e.g. "item 2 price was 1500 category groceries"
         return self._apply_freeform_correction(member, text, from_phone)
+
+    _HELP_TEXT = (
+        "Here's what I can do:\n"
+        "- Send a photo of a receipt to log it\n"
+        "- \"show my items\" — see what's on your last receipt\n"
+        "- \"how much have I spent\" — your running total by category\n"
+        "- \"item 2 price was 2500\" — correct a logged item\n"
+        "- \"help\" — see this again"
+    )
+
+    def _handle_known_intent(self, member, text: str, from_phone: str) -> Optional[str]:
+        """Simple keyword matching — no LLM call, kept intentionally cheap. Checked
+        before the correction parser so plain-English asks don't get mistaken for a
+        failed correction attempt."""
+        t = text.strip().lower()
+
+        if re.search(r"\bhelp\b", t) or t in ("?", "commands"):
+            self.whatsapp.send_text(from_phone, self._HELP_TEXT)
+            return self._HELP_TEXT
+
+        if ("show" in t or "list" in t or "see" in t) and ("item" in t or "log" in t):
+            reply = self._format_last_receipt_recap(member)
+            self.whatsapp.send_text(from_phone, reply)
+            return reply
+
+        if "spent" in t or "spending" in t or "how much" in t:
+            reply = self._format_member_spend(member)
+            self.whatsapp.send_text(from_phone, reply)
+            return reply
+
+        return None
+
+    def _format_last_receipt_recap(self, member) -> str:
+        recent = self.store.list_receipts(family_id=member.family_id)
+        my_recent = [r for r in recent if r.member_id == member.id]
+        if not my_recent:
+            return "You haven't logged any receipts yet — send a photo to get started 🙂."
+        receipt = my_recent[0]
+        items = self.store.list_line_items(receipt.id)
+        categories = self.store.list_categories()
+        return self._format_confirmation(items, categories, receipt)
+
+    def _format_member_spend(self, member) -> str:
+        receipts = [
+            r for r in self.store.list_receipts(family_id=member.family_id, status=ReceiptStatus.CONFIRMED)
+            if r.member_id == member.id
+        ]
+        if not receipts:
+            return "You don't have any confirmed receipts yet — send a photo to log one 🙂."
+
+        categories = self.store.list_categories()
+        cat_by_id = {c.id: c for c in categories}
+        by_category: dict[str, Decimal] = {}
+        total = Decimal("0")
+        for r in receipts:
+            for li in self.store.list_line_items(r.id):
+                cat_name = cat_by_id.get(li.category_id).name if cat_by_id.get(li.category_id) else "Other"
+                by_category[cat_name] = by_category.get(cat_name, Decimal("0")) + li.price
+                total += li.price
+
+        lines = [f"Your spending so far ({len(receipts)} confirmed receipt(s)):", "", f"Total: {_format_ngn(total)}"]
+        if len(by_category) > 1:
+            lines.append("")
+            lines.append("By category:")
+            for name, amt in sorted(by_category.items(), key=lambda kv: -kv[1]):
+                pct = int((amt / total * 100).to_integral()) if total else 0
+                lines.append(f"  {name}: {_format_ngn(amt)} ({pct}%)")
+        return "\n".join(lines)
 
     def _resolve_clarification(self, member, cl: Clarification, text: str, from_phone: str) -> str:
         answer = text.strip()
@@ -233,6 +317,13 @@ class CapturePipeline:
         return "resolved"
 
     def _apply_freeform_correction(self, member, text: str, from_phone: str) -> str:
+        # No digit at all -> this isn't an attempted correction (e.g. "hey", "thanks"),
+        # so don't imply we tried and failed to parse one.
+        if not re.search(r"\d", text):
+            reply = "Hey! Send a photo of a receipt to log a purchase, or reply to a recent one with a correction like 'item 2 price was 2500'."
+            self.whatsapp.send_text(from_phone, reply)
+            return reply
+
         # Find latest receipt (any status).
         recent = self.store.list_receipts(family_id=member.family_id)
         my_recent = [r for r in recent if r.member_id == member.id]

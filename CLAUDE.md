@@ -46,10 +46,13 @@ file is a summary and pointer, not a replacement for it.
 - **No split/shared purchases.** A receipt belongs entirely to whoever sent
   it. Don't add payer/beneficiary logic.
 - **No app or dashboard.** WhatsApp is the only interface for v1.
-- **Extraction model: Gemini, `gemini-3.5-flash-lite` by default.**
-  Benchmark against `gemini-2.5-pro` on real receipts before committing —
-  this hasn't been done yet. Don't assume Flash-Lite is confirmed-good
-  until that test has run.
+- **Extraction model: Gemini, `gemini-3.5-flash-lite`, confirmed.** Validated
+  against 6 real family receipts — 0.90–0.99 confidence, correct totals
+  every time, zero failures (architecture.md changelog v1.3). The planned
+  `gemini-2.5-pro` cross-benchmark was dropped: that model is retired, and
+  its replacement (`gemini-3.1-pro-preview`) needs paid billing this
+  project doesn't have enabled. Don't re-run that comparison unless billing
+  gets enabled or Flash-Lite's real-world accuracy degrades.
 - **Categorization is rules-first, LLM-fallback, self-reinforcing.**
   Keyword match against `categories.keywords` in Supabase; only call the
   LLM when nothing matches; whatever the LLM assigns gets appended back
