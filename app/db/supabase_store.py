@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from app.db.base import DataStore
-from app.models import Category, Clarification, Family, LineItem, Member, Receipt, WeeklySummary
+from app.db.base import DataStore, normalize_breakdown
+from app.models import (
+    Category,
+    Clarification,
+    ConversationTurn,
+    Family,
+    LineItem,
+    Member,
+    MemberMemory,
+    Receipt,
+    WeeklySummary,
+)
 
 
 class SupabaseStore(DataStore):
@@ -83,6 +93,27 @@ class SupabaseStore(DataStore):
     def update_receipt_status(self, receipt_id: UUID, status: str) -> None:
         self._client.table("receipts").update({"status": status}).eq("id", str(receipt_id)).execute()
 
+    def update_receipt(
+        self,
+        receipt_id: UUID,
+        *,
+        vendor: Optional[str] = None,
+        purchase_date: Optional[date] = None,
+        total: Optional[Decimal] = None,
+        raw_extraction: Optional[dict] = None,
+    ) -> None:
+        payload: dict = {}
+        if vendor is not None:
+            payload["vendor"] = vendor
+        if purchase_date is not None:
+            payload["purchase_date"] = purchase_date.isoformat()
+        if total is not None:
+            payload["total"] = float(total)
+        if raw_extraction is not None:
+            payload["raw_extraction"] = raw_extraction
+        if payload:
+            self._client.table("receipts").update(payload).eq("id", str(receipt_id)).execute()
+
     def list_receipts(
         self,
         family_id: Optional[UUID] = None,
@@ -120,7 +151,13 @@ class SupabaseStore(DataStore):
         return [LineItem(**row) for row in r.data]
 
     def list_line_items(self, receipt_id: UUID) -> list[LineItem]:
-        r = self._client.table("line_items").select("*").eq("receipt_id", str(receipt_id)).execute()
+        r = (
+            self._client.table("line_items")
+            .select("*")
+            .eq("receipt_id", str(receipt_id))
+            .order("position")
+            .execute()
+        )
         return [LineItem(**row) for row in r.data]
 
     def update_line_item(
@@ -179,6 +216,21 @@ class SupabaseStore(DataStore):
         )
         return Clarification(**r.data[0]) if r.data else None
 
+    def list_open_clarifications_for_member(self, member_id: UUID) -> list[Clarification]:
+        r_receipts = self._client.table("receipts").select("id").eq("member_id", str(member_id)).execute()
+        receipt_ids = [row["id"] for row in r_receipts.data]
+        if not receipt_ids:
+            return []
+        r = (
+            self._client.table("clarifications")
+            .select("*")
+            .in_("receipt_id", receipt_ids)
+            .eq("resolved", False)
+            .order("created_at")
+            .execute()
+        )
+        return [Clarification(**row) for row in r.data]
+
     def resolve_clarification(self, clarification_id: UUID, answer: str) -> Clarification:
         r = (
             self._client.table("clarifications")
@@ -188,6 +240,86 @@ class SupabaseStore(DataStore):
             .execute()
         )
         return Clarification(**r.data[0])
+
+    # ---------- conversation memory (tables from migrations/0002) ----------
+    def add_conversation_turn(self, turn: ConversationTurn) -> ConversationTurn:
+        r = self._client.table("conversation_turns").insert(turn.model_dump(mode="json")).execute()
+        return ConversationTurn(**r.data[0])
+
+    def list_conversation_turns(
+        self, member_id: UUID, limit: Optional[int] = None
+    ) -> list[ConversationTurn]:
+        q = (
+            self._client.table("conversation_turns")
+            .select("*")
+            .eq("member_id", str(member_id))
+            .order("created_at", desc=True)
+        )
+        if limit:
+            q = q.limit(limit)
+        rows = q.execute().data
+        return [ConversationTurn(**row) for row in reversed(rows)]
+
+    def delete_conversation_turns(self, turn_ids: list[UUID]) -> None:
+        if turn_ids:
+            self._client.table("conversation_turns").delete().in_(
+                "id", [str(t) for t in turn_ids]
+            ).execute()
+
+    def get_member_state(self, member_id: UUID) -> dict:
+        r = (
+            self._client.table("member_state")
+            .select("state")
+            .eq("member_id", str(member_id))
+            .limit(1)
+            .execute()
+        )
+        return dict(r.data[0].get("state") or {}) if r.data else {}
+
+    def save_member_state(self, member_id: UUID, state: dict) -> None:
+        self._client.table("member_state").upsert(
+            {"member_id": str(member_id), "state": state, "updated_at": datetime.now(timezone.utc).isoformat()},
+            on_conflict="member_id",
+        ).execute()
+
+    def list_member_memories(self, member_id: UUID) -> list[MemberMemory]:
+        r = (
+            self._client.table("member_memories")
+            .select("*")
+            .eq("member_id", str(member_id))
+            .order("created_at")
+            .execute()
+        )
+        return [MemberMemory(**row) for row in r.data]
+
+    def add_member_memory(self, memory: MemberMemory) -> MemberMemory:
+        r = self._client.table("member_memories").insert(memory.model_dump(mode="json")).execute()
+        return MemberMemory(**r.data[0])
+
+    def delete_member_memory(self, memory_id: UUID) -> None:
+        self._client.table("member_memories").delete().eq("id", str(memory_id)).execute()
+
+    # ---------- spending questions ----------
+    def spending_breakdown(
+        self,
+        family_id: UUID,
+        *,
+        member_id: Optional[UUID] = None,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        category_id: Optional[UUID] = None,
+        item_query: Optional[str] = None,
+    ) -> dict:
+        # One round trip; the SQL function does all the summing (migrations/0003).
+        r = self._client.rpc("spending_breakdown", {
+            "p_family_id": str(family_id),
+            "p_member_id": str(member_id) if member_id else None,
+            "p_start": start.isoformat() if start else None,
+            "p_end": end.isoformat() if end else None,
+            "p_category_id": str(category_id) if category_id else None,
+            "p_item": item_query or None,
+        }).execute()
+        return normalize_breakdown(r.data or {})
 
     # ---------- weekly summaries ----------
     def create_weekly_summary(self, summary: WeeklySummary) -> WeeklySummary:

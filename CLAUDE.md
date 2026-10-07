@@ -21,18 +21,17 @@ phone) rather than a new app.
 
 ## Where we are
 
-Design phase complete, implementation not started. Two reference documents
-exist and should be treated as authoritative:
+Build order steps 1–6 are implemented in `app/` (FastAPI): extraction is
+validated (changelog v1.3), capture → categorize → Supabase → reply works,
+and text messages go through an LLM conversation agent with 3-layer memory
+and optional Langfuse tracing (changelog v1.5, v1.6). `architecture.md` is the
+authoritative spec:
 
 - **`architecture.md`** — the full architecture and system specification.
   Living document with a changelog. This is the source of truth for
   components, data model, API contracts, error handling, and requirements
   (FR-1 through FR-7). If this file and any code disagree, the code is
   wrong unless the architecture doc's changelog shows the decision changed.
-- **Build spec / master prompt** — step-by-step build order, starting with
-  validating Gemini extraction against real sample receipts *before*
-  building any infrastructure. That validation step has not been run yet —
-  do it first if picking this project up cold.
 
 Read `architecture.md` in full before making any structural decision. This
 file is a summary and pointer, not a replacement for it.
@@ -72,6 +71,20 @@ file is a summary and pointer, not a replacement for it.
 - **`needs_review` receipts are excluded from weekly summaries** until
   resolved. Under-reporting a pending item for a week is the correct
   tradeoff over reporting a guess as fact.
+- **The LLM decides intent; code validates and writes** (architecture.md
+  §7.7). Never add a text path that changes data from a regex or keyword
+  match — that's what caused the v1.5 bugs. Corrections are matched to
+  clarifications by item number; ambiguity becomes a question; confirmations
+  say exactly what changed; spending answers only cite computed numbers.
+- **3-layer memory (v1.6):** cache (in-process TTL for members, categories,
+  long-term memories; dropped on write), conversation state
+  (`conversation_turns` + `member_state`), long-term memory
+  (`member_memories`). Never cache receipts, clarifications, state or
+  totals. Money is never "remembered" — totals come from the
+  `spending_breakdown` SQL function on every question.
+- **Observability is Langfuse**, optional and off without keys. Never send
+  phone numbers or image bytes to it. Router eval cases live in
+  `evals/intent_router_cases.json`; add a case for every new routing bug.
 
 ## Tech stack
 
@@ -115,6 +128,9 @@ prompt or model changes).
 
 - Log raw Gemini extraction JSON to `receipts.raw_extraction` — this is the
   debugging trail when a categorization looks wrong later.
+- Every Gemini call goes through `app/services/llm.py` so it's traced.
+- Re-run `validate_intents.py` whenever the router prompt or chat model
+  changes, and `pytest` before every deploy.
 - Never let a failed extraction silently drop a receipt. Worst case is
   `needs_review`, never data loss.
 - Environment variables and their purposes are listed in `architecture.md`

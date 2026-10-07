@@ -1,9 +1,9 @@
 # Family expense tracker — architecture and system specification
 
 **Document status:** Living document — update in place as decisions change
-**Version:** 1.3
+**Version:** 1.5
 **Owner:** Khadijah
-**Last updated:** 2026-09-12
+**Last updated:** 2026-10-07
 
 ## Changelog
 
@@ -13,6 +13,9 @@
 | 1.1 | 2026-08-20 | Reframed as an architecture + system specification: added functional requirements, expanded non-functional requirements, endpoint spec, testing strategy, configuration reference, glossary |
 | 1.2 | 2026-09-12 | Webhook handler now parses `value.statuses` (delivery status events), not just `value.messages`, and verifies `X-Hub-Signature-256` when `WHATSAPP_APP_SECRET` is set. Codebase reorganized into a modular `app/` package (routers, services, db layer) — no behavior change to FR-1–FR-7. |
 | 1.3 | 2026-09-12 | Extraction model confirmed: `gemini-3.5-flash-lite` validated against 6 real receipts (build order step 1) — 0.90–0.99 confidence, correct totals every time, zero failures. Planned benchmark against `gemini-2.5-pro` dropped: that model is retired, and its replacement `gemini-3.1-pro-preview` needs paid billing the project doesn't have. Committing to Flash-Lite without the cross-model comparison. |
+| 1.4 | 2026-09-20 | Fixed FR-6 bug found in real Supabase testing: `line_items` had no explicit ordering column, so a correction like "item 19 is Household" could silently apply to a different row than the one shown in chat (Postgres doesn't guarantee row order without `ORDER BY`). Added `line_items.position` (1-based, set from extraction order) and order `list_line_items` by it. Migration in `supabase/migrations/0001_line_item_position.sql` for projects created before this fix. Also added three keyword-matched (no-LLM) chat intents — "help", show-last-receipt recap, and running spend-by-category — so plain-English asks outside the correction syntax get a real answer instead of the generic fallback. |
+| 1.5 | 2026-10-07 | Text messages now go through an LLM conversation agent (§7.7) instead of the regex correction parser, fixing three bugs that changed data silently: (1) "bought 2 crates of eggs for 4500" after an unreadable photo set item 2 of the last receipt to ₦4,500 — purchases described in words are now logged as new receipts (filling the empty one the unreadable photo created); (2) while a clarification was open, any message was saved as its answer and could re-categorize the item and confirm the receipt — questions are now answered and the clarification stays open, with a reminder; (3) with two open clarifications, a correction applied to whichever row the DB returned first — answers are now matched by item number, and an unnumbered answer asks which item. Gemini (`GEMINI_CHAT_MODEL`, default `gemini-3.5-flash-lite`) decides intent; code validates every change against the data, asks yes/no below `INTENT_MIN_CONFIDENCE` (0.7), and says exactly what changed. Spending questions are answered from computed numbers and rejected if they cite a ₦ amount not in the data. Added 3-layer memory (tables `conversation_turns`, `member_state`, `member_memories`; migration `0002_conversation_memory.sql`) and optional Langfuse tracing (§16). Strict offline fallback parser when Gemini is unavailable. New golden set for the router: `validate_intents.py`. |
+| 1.6 | 2026-10-07 | Memory re-layered as **cache → conversation state → long-term** (§7.7): new layer 1 is an in-process TTL cache (`app/services/cache.py`, 5 min) for member lookup, family members, categories and long-term memories, dropped immediately on writes through the store; recent turns moved into layer 2 alongside the state slots. Spending totals now come from a Postgres function `spending_breakdown` (migration `0003_spending_breakdown.sql`) instead of summing line items in Python, so the bot's numbers come only from SQL. Langfuse now also records a `route` span (the router's decision), an `act:<intent>` span (what code did) and a `db.<method>` span per database call with latency and cache hit/miss (`app/db/instrumented.py`). Router eval set moved to `evals/intent_router_cases.json` (shared by `validate_intents.py` and `tests/test_evals.py`); `validate_intents.py --langfuse` records a run against Langfuse dataset `intent-router-golden`. Live result on `gemini-3.5-flash-lite`: 14/14. |
 
 *Add a row here every time a real decision changes — model swap, schema change, scope change. This document is only useful if it stays truthful.*
 
@@ -99,6 +102,11 @@ prompt a targeted follow-up.
 A family member can correct a stored entry via a chat reply.
 - *Accept:* a correction reply patches the specific `line_items` row it
   refers to, without requiring the receipt to be resent.
+- *Accept:* a message that isn't a correction (a purchase described in words,
+  a question) never changes an existing row.
+- *Accept:* with several open clarifications, a reply changes only the item
+  it names; if it names none, the bot asks which.
+- *Accept:* every change is confirmed back with what changed (old → new).
 
 **FR-7: Weekly reporting**
 Confirmed spend is aggregated and reported on a schedule.
@@ -189,9 +197,13 @@ running. Responsibilities:
 - Receive inbound message events, identify the sender by phone number.
 - On an image message: download it, call Gemini for extraction, run the
   categorizer, write results to Supabase, and reply.
-- On a text reply to a pending clarification: match it to the open
-  `clarifications` row, patch the relevant `line_items` row, mark the
-  clarification resolved.
+- On a text message: hand it to the conversation agent (§7.7), which decides
+  the intent — answer a clarification, correct an item, log a purchase
+  described in words, answer a spending question — validates it against the
+  data, and only then patches rows or replies.
+- Show WhatsApp's "typing…" indicator from the moment a message is picked up
+  until the reply is sent (refreshed every 20s, capped at 60s), so the member
+  sees the bot is working while Gemini runs.
 - Handle onboarding: first message from an unrecognized phone number
   triggers a "what's your name?" flow that creates a `members` row.
 
@@ -241,6 +253,64 @@ external scheduler like GitHub Actions or a Render cron job (keeps the
 schedule decoupled from the database, easier to change independently).
 Reads confirmed entries, aggregates, formats, sends via WhatsApp API.
 
+### 7.7 Conversation agent and memory
+
+Text from a known member goes through `app/services/agent.py` in three steps:
+
+1. **Route** — one Gemini call (`GEMINI_CHAT_MODEL`) reads the message with
+   the member's memory and live data (open clarifications with their item
+   numbers, the last receipt, what the bot is waiting on) and returns a JSON
+   decision: intent (`answer_clarification`, `correct_item`, `log_purchase`,
+   `spending_question`, `show_last_receipt`, `help`, `confirm_pending`,
+   `cancel_pending`, `smalltalk`, `unclear`), item number, patch, purchase or
+   query spec. The LLM decides; it never writes.
+2. **Check** — code validates the decision before anything changes: the item
+   exists, the clarification is open, the category is real, prices are
+   positive numbers. Answers are matched to clarifications **by item number**;
+   with several open and no number, the bot asks which. Ambiguity becomes a
+   question, never a guess. A data-changing decision below
+   `INTENT_MIN_CONFIDENCE` is restated for a yes/no first (stored as
+   `pending_action`, re-validated when the member says yes).
+3. **Act** — apply the change and reply. Change confirmations are written by
+   code and name exactly what changed ("item 2: price ₦3,000 → ₦4,500").
+   Spending answers are phrased by a second Gemini call from numbers the
+   database computed (the `spending_breakdown` SQL function, confirmed
+   receipts only; `app/services/spending.py` only picks filters and formats);
+   if the phrasing cites any ₦ amount not in that data, a templated summary of
+   the same numbers is sent instead.
+   While a clarification is open, any non-answer reply ends with a reminder
+   of what's still waiting.
+
+Purchases described in words become confirmed receipts (`raw_extraction`
+holds `{"source": "text", ...}`) and go through the normal rules-first
+categorizer. If the member was asked to describe an unreadable photo, the
+description fills that photo's empty `needs_review` receipt rather than
+creating a second row.
+
+If Gemini is unavailable, a strict fallback parser accepts only exact command
+shapes (`ok 3`, `item 2 price was 1500`, `help`, `how much have I spent`) and
+otherwise replies without changing anything.
+
+**Memory — three layers** (v1.6). Layers 2 and 3 live in Supabase so the
+handler stays stateless; layer 1 is a disposable in-process cache.
+
+| Layer | Where | Holds | Used for |
+|---|---|---|---|
+| 1. Cache | process memory (`app/services/cache.py`, via `app/db/instrumented.py`), 5 min TTL | member-by-phone, family members, categories + keywords, long-term memories | skipping repeat Supabase reads on every message |
+| 2. Conversation state | `conversation_turns`, `member_state` | last `MEMORY_RECENT_TURNS` (12) messages per member; typed slots with a TTL (`MEMORY_STATE_TTL_MINUTES`, 30): `awaiting_description`, `pending_action` | resolving short replies ("yes", "the second one", "1500") and knowing what the bot just asked for |
+| 3. Long-term memory | `member_memories` | durable facts the member stated (budgets, what a shop nickname means) + one rolling conversation summary | personal context in routing and answers |
+
+The cache only holds rows that change rarely and only through this app; any
+write through the store drops the matching entries at once. Receipts, line
+items, clarifications, turns, state slots and spending totals are never
+cached, because a stale copy could change data or an answer. With more than
+one app instance, another instance's copy can lag by up to the TTL.
+
+When the stored turns pass `MEMORY_COMPACT_AFTER` (40), the older ones are
+summarized into layer 3 and deleted. Open clarifications are state too, but
+they stay in `clarifications` (not duplicated). Receipts and line items are
+the source of truth for money and are queried fresh — never remembered.
+
 ## 8. Data architecture
 
 ### 8.1 Entity overview
@@ -255,6 +325,12 @@ Reads confirmed entries, aggregates, formats, sends via WhatsApp API.
 - `clarifications` — open questions the bot has asked and is waiting on.
 - `weekly_summaries` — cached output of the reporting job, useful for
   historical comparison ("are we spending more than last month").
+- `conversation_turns`, `member_state`, `member_memories` — the agent's
+  3-layer memory (§7.7). Added in v1.5 via
+  `supabase/migrations/0002_conversation_memory.sql`.
+- `spending_breakdown(...)` — SQL function returning totals by category,
+  member, vendor and top items for a spending question (§7.7). Added in v1.6
+  via `supabase/migrations/0003_spending_breakdown.sql`.
 
 ### 8.2 Schema
 
@@ -300,7 +376,8 @@ create table line_items (
   price numeric(12,2) not null,
   category_id uuid references categories(id),
   confidence numeric(3,2),
-  needs_review boolean default false
+  needs_review boolean default false,
+  position integer not null default 1
 );
 
 create table clarifications (
@@ -325,7 +402,7 @@ create table weekly_summaries (
 
 create index idx_members_phone on members(phone_number);
 create index idx_receipts_member on receipts(member_id, created_at);
-create index idx_line_items_receipt on line_items(receipt_id);
+create index idx_line_items_receipt on line_items(receipt_id, position);
 create index idx_line_items_category on line_items(category_id);
 ```
 
@@ -489,6 +566,13 @@ weeks of actual family receipts. Log threshold changes in the changelog.
 | `SUPABASE_URL` | Supabase project endpoint |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-side Supabase auth (never exposed client-side — irrelevant here since there's no client, but keep the discipline) |
 | `CRON_SHARED_SECRET` | Only needed if `/cron/weekly-summary` is triggered externally rather than via `pg_cron` |
+| `GEMINI_CHAT_MODEL` | Model for intent routing, spending answers and memory summaries. Default `gemini-3.5-flash-lite` |
+| `INTENT_MIN_CONFIDENCE` | Router confidence below which a data change is restated for yes/no first. Default `0.7` |
+| `MEMORY_RECENT_TURNS` | Layer-1 turns shown to the router. Default `12` |
+| `MEMORY_COMPACT_AFTER` | Layer-1 size that triggers summarizing older turns into layer 3. Default `40` |
+| `MEMORY_STATE_TTL_MINUTES` | How long layer-2 slots (awaiting a description, pending yes/no) stay live. Default `30` |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | Turn on Langfuse tracing (§16). Tracing is off until both are set |
+| `LANGFUSE_BASE_URL` | Langfuse region/host. Default `https://cloud.langfuse.com` (EU); US is `https://us.cloud.langfuse.com` |
 
 ## 15. Cost considerations
 
@@ -515,6 +599,18 @@ Minimum viable logging for a personal project:
 - Log raw Gemini extraction JSON per receipt (already stored in
   `receipts.raw_extraction` — useful for debugging misclassifications after
   the fact without needing separate log infrastructure).
+- **Langfuse tracing** (optional, `app/observability.py`): one trace per
+  inbound WhatsApp message, with a generation for every Gemini call inside it
+  (`extract-receipt`, `categorize-item`, `route-intent`,
+  `answer-spending-question`, `summarize-conversation`) — input, output,
+  latency, tokens. Grouped by member (`user_id` is a hash of the phone number,
+  never the number) and by day (`session_id`). Receipt image bytes are never
+  sent, only their size. For text messages the trace also holds a `route`
+  span (the router's full decision and whether it came from Gemini or the
+  fallback parser) and an `act:<intent>` span (the reply code produced).
+  Every database call is a `db.<method>` span with its latency, row count and
+  cache hit/miss, so slow Supabase calls show up next to slow Gemini calls.
+  Off until `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set.
 - Track, even informally: clarification rate (how often the bot has to ask
   vs. auto-confirm) as the key signal for whether confidence thresholds need
   tuning, and category-fallback rate (how often the rules table misses and
@@ -530,6 +626,14 @@ Minimum viable logging for a personal project:
   of 10-15 real sample receipt photos (mix of clean, faded, and
   handwritten) with expected output — re-run this set any time the prompt
   or model changes, and record the result in the changelog.
+- **Intent router golden set:** `evals/intent_router_cases.json` holds the
+  cases (including the three v1.5 bugs). `validate_intents.py` runs them
+  through the real router and checks the decision; add `--langfuse` to record
+  the run against the Langfuse dataset `intent-router-golden` with per-case
+  scores. Re-run whenever the router prompt or `GEMINI_CHAT_MODEL` changes
+  and record the pass rate in the changelog. `tests/test_evals.py` replays
+  the same cases offline with Gemini down and asserts no wrong data changes;
+  `tests/test_agent.py` covers each scenario with Gemini mocked.
 - **Webhook tests:** simulated WhatsApp payloads (image message, text
   reply, onboarding message) against the handler with Gemini and Supabase
   mocked, to catch routing bugs without spending API credits.

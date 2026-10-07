@@ -93,6 +93,10 @@ class LineItem(BaseModel):
     category_id: Optional[UUID] = None
     confidence: Optional[float] = None
     needs_review: bool = False
+    # 1-based position within the receipt — the chat UX's "item N" numbering
+    # refers to this, not insertion/row order (which SQL doesn't guarantee
+    # without an explicit ORDER BY).
+    position: int = 1
 
 
 class Clarification(BaseModel):
@@ -112,6 +116,29 @@ class WeeklySummary(BaseModel):
     week_end: date_cls
     summary_text: str
     total_spend: Decimal = Decimal("0")
+    created_at: datetime_cls = Field(default_factory=datetime_cls.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Conversation memory — architecture.md §7.7 (3 layers)
+# ---------------------------------------------------------------------------
+
+class ConversationTurn(BaseModel):
+    """Layer 2 (conversation state): one message in a member's chat with the bot."""
+    id: UUID = Field(default_factory=uuid4)
+    member_id: UUID
+    role: str  # "user" | "assistant"
+    content: str
+    intent: Optional[str] = None
+    created_at: datetime_cls = Field(default_factory=datetime_cls.utcnow)
+
+
+class MemberMemory(BaseModel):
+    """Layer 3 (long-term memory): a durable fact, preference or conversation summary."""
+    id: UUID = Field(default_factory=uuid4)
+    member_id: UUID
+    kind: str = "fact"  # "fact" | "summary"
+    content: str
     created_at: datetime_cls = Field(default_factory=datetime_cls.utcnow)
 
 

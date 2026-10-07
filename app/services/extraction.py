@@ -200,9 +200,9 @@ def extract_receipt(
         else:
             mime_hint = "image/jpeg"
 
-    model = _gemini_model(model_name)
-
     import base64
+
+    from app.services import llm
 
     prompt = [
         EXTRACTION_SYSTEM_PROMPT,
@@ -210,8 +210,10 @@ def extract_receipt(
     ]
 
     logger.info("Calling Gemini extract_receipt (%d bytes, %s)", len(image_bytes), mime_hint)
-    response = model.generate_content(prompt, request_options={"timeout": 60})
-    text = response.text if hasattr(response, "text") else ""
+    text = llm.generate(
+        "extract-receipt", prompt, model_name=model_name, timeout=60,
+        metadata={"image_bytes": len(image_bytes), "mime": mime_hint},
+    )
     logger.debug("Gemini raw extraction response: %s", text)
 
     cleaned = _clean_json_response(text)
@@ -243,10 +245,11 @@ def categorize_with_llm(item_name: str) -> str:
         item_name=item_name,
     )
 
-    model = _gemini_model()
+    from app.services import llm
+
     logger.info("Calling Gemini categorize_with_llm for %r", item_name)
-    response = model.generate_content([prompt], request_options={"timeout": 30})
-    raw = (response.text if hasattr(response, "text") else "").strip().strip('"').strip("'")
+    text = llm.generate("categorize-item", [prompt], model_name="gemini-3.5-flash-lite", timeout=30)
+    raw = (text or "").strip().strip('"').strip("'")
     raw_lc = raw.lower()
     if raw_lc in allowed_lc:
         return allowed_lc[raw_lc]
