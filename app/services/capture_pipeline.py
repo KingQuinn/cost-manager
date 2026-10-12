@@ -77,13 +77,15 @@ class CapturePipeline:
         _PENDING_ONBOARD.pop(phone, None)
 
     # ---- image receipt processing ----------------------------------------
-    def process_image(self, from_phone: str, image_bytes: bytes, image_id: str) -> str:
-        """Core capture: extraction → categorize → persist → reply. Returns a summary string for testing."""
+    def process_image(self, from_phone: str, image_bytes: bytes, image_id: str,
+                      mime: Optional[str] = None) -> str:
+        """Core capture: extraction → categorize → persist → reply. Returns a summary string for testing.
+        `image_bytes` may be a photo or a PDF receipt (`mime` from WhatsApp, else sniffed)."""
         member = self.store.get_member_by_phone(from_phone)
         if member is None:
             return "[process_image called on unknown phone"
 
-        extraction = extract_receipt(image_bytes)
+        extraction = extract_receipt(image_bytes, mime)
         raw_extraction = extraction.model_dump(mode="json")
 
         if extraction.overall_confidence == 0:
@@ -237,7 +239,8 @@ def process_inbound_message(
     Shared by the real webhook route and the local `/test/message` route so both
     exercise the exact same dispatch logic. Each call is one Langfuse trace.
     """
-    kind = "image" if (msg.image_id or msg.image_bytes is not None) else ("text" if msg.text is not None else "other")
+    kind = ("pdf" if msg.media_mime == "application/pdf" else "image") if (msg.image_id or msg.image_bytes is not None) \
+        else ("text" if msg.text is not None else "other")
     with observability.trace_message(
         msg.from_phone, kind, input=msg.text if kind == "text" else f"[{kind} message]"
     ) as trace:
@@ -261,14 +264,20 @@ def _dispatch(pipe: CapturePipeline, msg: WhatsAppInboundMessage, whatsapp: What
         try:
             msg.image_bytes = whatsapp.download_image(msg.image_id)
         except Exception as e:
-            logger.warning("Couldn't download WhatsApp image %s: %s", msg.image_id, e)
-            whatsapp.send_text(msg.from_phone, "I couldn't load that image — could you try sending it again?")
+            logger.warning("Couldn't download WhatsApp media %s: %s", msg.image_id, e)
+            what = "file" if msg.media_mime == "application/pdf" else "image"
+            whatsapp.send_text(msg.from_phone, f"I couldn't load that {what}. Could you try sending it again?")
             return "image-download-failed"
 
     if msg.image_bytes is not None:
-        return pipe.process_image(msg.from_phone, msg.image_bytes, msg.image_id or "")
+        return pipe.process_image(msg.from_phone, msg.image_bytes, msg.image_id or "", msg.media_mime)
     elif msg.text is not None:
         return pipe.handle_text(msg.from_phone, msg.text)
     else:
-        whatsapp.send_text(msg.from_phone, "I only understand photos of receipts or correction messages right now 🙂")
+        if msg.unsupported_document:
+            reply = (f"I can't open {msg.unsupported_document}. Send the receipt as a photo or a PDF, "
+                     "or type what you bought.")
+        else:
+            reply = "I can read receipt photos, PDF receipts and text messages, but not that kind of message yet 🙂"
+        whatsapp.send_text(msg.from_phone, reply)
         return "ignored"

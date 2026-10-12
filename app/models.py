@@ -151,8 +151,10 @@ class WhatsAppInboundMessage(BaseModel):
     from_phone: str
     message_id: str
     text: Optional[str] = None
-    image_id: Optional[str] = None
+    image_id: Optional[str] = None      # WhatsApp media id: a photo, or a PDF/image sent as a document
     image_bytes: Optional[bytes] = None
+    media_mime: Optional[str] = None    # e.g. "application/pdf"; None = sniff from the bytes
+    unsupported_document: Optional[str] = None  # filename of a document we can't read (e.g. .docx)
     timestamp: datetime_cls = Field(default_factory=datetime_cls.utcnow)
 
 

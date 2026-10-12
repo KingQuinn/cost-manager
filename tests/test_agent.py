@@ -162,7 +162,7 @@ def test_bug1_purchase_in_words_logs_new_receipt_not_correction(env):
 def test_bug1_description_after_unreadable_photo_fills_that_receipt(env, monkeypatch):
     from app.models import ExtractionResult
     monkeypatch.setattr(capture_pipeline, "extract_receipt",
-                        lambda b: ExtractionResult(overall_confidence=0.0, extraction_notes="blurry"))
+                        lambda b, mime=None: ExtractionResult(overall_confidence=0.0, extraction_notes="blurry"))
     add_receipt(env, "Shoprite", [("Rice", 30000, "Groceries"), ("Milk", 1500, "Groceries")])
     env.pipe.process_image(PHONE, b"\xff\xd8\xff blurry", "img1")
     assert "describe the purchase" in env.wa.sent[-1]
@@ -702,13 +702,67 @@ def test_edit_by_name_not_found_changes_nothing(env):
     assert "couldn't find an item called 'chapman'" in say(env, "chapman is dining")
 
 
-def test_i_have_a_receipt_asks_for_the_photo(env):
-    env.llm.router = {"intent": "expect_receipt", "confidence": 0.95}
-    reply = say(env, "i have a receipt")
-    assert reply.startswith("Great, send me a photo of the receipt")
+def test_receipt_mention_gets_geminis_reply_in_context(env):
+    """Umar: 'I have a receipt' shouldn't get a stiff 'send a photo' — it could be a PDF."""
+    env.llm.router = {"intent": "expect_receipt", "confidence": 0.95,
+                      "reply": "Sure! Send the PDF straight here and I'll log it."}
+    assert say(env, "I have the receipt as a pdf, can I send it?") == "Sure! Send the PDF straight here and I'll log it."
     assert env.store.list_receipts(family_id=env.member.family_id) == []
+
+
+def test_receipt_mention_without_gemini_reply_offers_photo_pdf_or_text(env):
+    env.llm.router = {"intent": "expect_receipt", "confidence": 0.95}
+    assert "a photo or a PDF both work" in say(env, "i have a receipt")
     env.llm.router = RuntimeError("Gemini down")  # the offline parser knows it too
-    assert say(env, "I have a receipt").startswith("Great, send me a photo")
+    assert "a photo or a PDF both work" in say(env, "I have a receipt")
+
+
+def test_receipt_mention_reply_cannot_invent_amounts(env):
+    env.llm.router = {"intent": "expect_receipt", "confidence": 0.95, "reply": "Send it! Last one was ₦9,999."}
+    assert "₦9,999" not in say(env, "i have another receipt")
+
+
+def test_pdf_receipt_from_whatsapp_is_extracted(env, monkeypatch):
+    from app.models import ExtractedLineItem, ExtractionResult
+    from app.services.whatsapp import WhatsAppClient
+
+    payload = {"entry": [{"changes": [{"field": "messages", "value": {"messages": [
+        {"from": PHONE, "id": "wamid.PDF", "type": "document",
+         "document": {"id": "media-9", "mime_type": "application/pdf", "filename": "jumia-receipt.pdf"}},
+        {"from": PHONE, "id": "wamid.DOC", "type": "document",
+         "document": {"id": "media-10", "mime_type": "application/msword", "filename": "list.doc"}},
+    ]}}]}]}
+    pdf_msg, doc_msg = WhatsAppClient().parse_webhook_payload(payload).messages
+    assert (pdf_msg.image_id, pdf_msg.media_mime) == ("media-9", "application/pdf")
+
+    seen = {}
+
+    def fake_extract(b, mime=None):
+        seen["mime"] = mime
+        return ExtractionResult(vendor="Jumia", date=date(2026, 10, 2), total=Decimal("5000"), overall_confidence=0.95,
+                                line_items=[ExtractedLineItem(name="Rice 5kg", total_price=Decimal("5000"), confidence=0.95)])
+
+    monkeypatch.setattr(capture_pipeline, "extract_receipt", fake_extract)
+    env.wa.download_image = lambda media_id: b"%PDF-1.7 ..."
+    reply = process_inbound_message(env.pipe, pdf_msg, env.wa)
+    assert seen["mime"] == "application/pdf" and "Logged 1 item(s) from Jumia, dated 02 Oct 2026" in reply
+
+    process_inbound_message(env.pipe, doc_msg, env.wa)
+    assert env.wa.sent[-1].startswith("I can't open list.doc. Send the receipt as a photo or a PDF")
+
+
+def test_pdf_bytes_are_sniffed_as_pdf(monkeypatch):
+    from app.services import extraction, llm as llm_mod
+
+    sent = {}
+
+    def fake_generate(name, parts, **kw):
+        sent["mime"] = parts[1]["mime_type"]
+        return '{"vendor": "X", "line_items": [], "overall_confidence": 0.0}'
+
+    monkeypatch.setattr(llm_mod, "generate", fake_generate)
+    extraction.extract_receipt(b"%PDF-1.4 fake")
+    assert sent["mime"] == "application/pdf"
 
 
 def test_item_question_matches_spellings_and_says_when_last_bought(env):
@@ -747,7 +801,7 @@ def test_receipt_items_the_rules_miss_go_to_gemini_in_one_call(env, monkeypatch)
     from app.models import ExtractedLineItem, ExtractionResult
 
     names = ["QWALPHA", "QWBETA", "QWGAMMA", "Rice 5kg"]  # Rice is caught by the keyword rules
-    monkeypatch.setattr(capture_pipeline, "extract_receipt", lambda b: ExtractionResult(
+    monkeypatch.setattr(capture_pipeline, "extract_receipt", lambda b, mime=None: ExtractionResult(
         vendor="Spar", date=date(2026, 10, 1), total=Decimal("400"), overall_confidence=0.95,
         line_items=[ExtractedLineItem(name=n, quantity=1, total_price=Decimal("100"), confidence=0.95)
                     for n in names]))
@@ -760,7 +814,7 @@ def test_receipt_items_the_rules_miss_go_to_gemini_in_one_call(env, monkeypatch)
 def test_categorization_failure_files_items_under_other(env, monkeypatch):
     from app.models import ExtractedLineItem, ExtractionResult
 
-    monkeypatch.setattr(capture_pipeline, "extract_receipt", lambda b: ExtractionResult(
+    monkeypatch.setattr(capture_pipeline, "extract_receipt", lambda b, mime=None: ExtractionResult(
         vendor="Spar", total=Decimal("100"), overall_confidence=0.95,
         line_items=[ExtractedLineItem(name="QWDELTA", quantity=1, total_price=Decimal("100"), confidence=0.95)]))
     monkeypatch.setattr(capture_pipeline, "categorize_many_with_llm",

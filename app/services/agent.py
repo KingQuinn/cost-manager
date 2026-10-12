@@ -82,10 +82,10 @@ INTENTS = (
 )
 MUTATING = {"answer_clarification", "correct_item", "log_purchase"}
 
+# Only used when Gemini didn't write its own reply for expect_receipt.
 EXPECT_RECEIPT_TEXT = (
-    "Great, send me a photo of the receipt 📸 and I'll log it. "
-    "Lay it flat with the whole receipt in the frame.\n"
-    "No photo? Type it out instead, e.g. \"bought 2 crates of eggs for 4500 at Shoprite\"."
+    "Sure, send it over: a photo or a PDF both work. "
+    "Or just type what you bought, e.g. \"bought 2 crates of eggs for 4500 at Shoprite\"."
 )
 
 HELP_TEXT = (
@@ -239,7 +239,7 @@ Return ONLY a JSON object:
   "query": {"scope": "me"|"family", "period": %(periods)s,
             "start": "YYYY-MM-DD"|null, "end": "YYYY-MM-DD"|null,
             "category": str|null, "item": str|null, "item_terms": [str]} | null,
-  "reply": str | null,              // only for smalltalk / unclear: a short friendly reply
+  "reply": str | null,              // smalltalk / unclear / expect_receipt: a short natural reply
   "remember": [str],                // durable facts worth keeping (see below), usually []
   "reasoning": str                  // one short sentence, for debugging
 }
@@ -257,9 +257,12 @@ Groceries". If they give a number, set item_number. If they name the item, ALWAY
 set item_name to the name as they wrote it; also set item_number only if that item \
 is on LAST RECEIPT. The item may be on an older receipt — that's fine, code finds \
 it by name. patch holds only the fields they changed.
-- expect_receipt: they say they have a receipt / want to log something but \
-haven't sent it or described what they bought ("I have a receipt", "I want to log \
-something", "let me send you a receipt"). Never log_purchase without items.
+- expect_receipt: they mention a receipt or purchase to log but haven't sent \
+it or said what they bought ("I have a receipt", "I'll send the invoice later", \
+"can I upload a PDF?", "I have 3 receipts from the market"). Write reply: a short, \
+natural answer to what they actually said. The bot accepts receipt photos, PDF \
+receipts (sent as a document), or a purchase typed in words; mention what fits \
+their message rather than listing everything. Never log_purchase without items.
 - log_purchase: describing a NEW purchase in words ("bought 2 crates of eggs for \
 4500", "paid 1500 for keke"). Numbers here are quantities and prices — never item \
 numbers, and this is never a correction. total_price is the line total \
@@ -520,21 +523,20 @@ class ConversationAgent:
             "log_purchase": self._do_log_purchase,
             "spending_question": self._do_spending_question,
             "show_last_receipt": self._do_show_last_receipt,
-            "expect_receipt": lambda m, t, d, c: EXPECT_RECEIPT_TEXT,
             "help": lambda m, t, d, c: HELP_TEXT,
             "confirm_pending": self._do_confirm_pending,
             "cancel_pending": self._do_cancel_pending,
         }
         handler = handlers.get(d.intent)
-        if handler is None:  # smalltalk / unclear
-            generic = (
+        if handler is None:  # smalltalk / unclear / expect_receipt: Gemini's own words
+            generic = EXPECT_RECEIPT_TEXT if d.intent == "expect_receipt" else (
                 "Sorry, I didn't quite get that. You can send a receipt photo, tell me a "
                 "purchase in words, or ask how much you've spent. Type 'help' for more."
             )
             reply = (d.reply or "").strip() or generic
             # Free-text replies may not quote money the bot can't back up.
             if d.source == "llm" and amounts_in(reply) - amounts_in(ctx.get("prompt_context", "") + " " + text):
-                logger.warning("Smalltalk reply cited unknown amounts; using generic reply")
+                logger.warning("Free-text reply cited unknown amounts; using generic reply")
                 reply = generic
         else:
             reply = handler(member, text, d, ctx)

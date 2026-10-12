@@ -13,7 +13,7 @@ from app.models import DEFAULT_CATEGORIES, ExtractedLineItem, ExtractionResult
 logger = logging.getLogger(__name__)
 
 EXTRACTION_SYSTEM_PROMPT = """\
-You are a receipt data extraction system. Given a photo of a receipt, extract \
+You are a receipt data extraction system. Given a photo or PDF of a receipt, extract \
 structured data. Respond ONLY with valid JSON matching the schema below — \
 no markdown fences, no commentary, no explanation.
 
@@ -203,7 +203,9 @@ def extract_receipt(
         # Tiny magic-number fallback for JPEG/PNG — enough for WhatsApp images
         # which are almost always JPEG.  mimetypes.guess_type on bytes isn't
         # a real API, so do this manually.
-        if image_bytes.startswith(b"\xff\xd8\xff"):
+        if image_bytes.startswith(b"%PDF"):
+            mime_hint = "application/pdf"
+        elif image_bytes.startswith(b"\xff\xd8\xff"):
             mime_hint = "image/jpeg"
         elif image_bytes.startswith(b"\x89PNG"):
             mime_hint = "image/png"

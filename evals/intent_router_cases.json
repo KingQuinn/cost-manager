@@ -221,6 +221,29 @@
     "period": "last_week",
     "item_terms_include": "doughnut"
    }
+  },
+  {
+   "id": "v17-pdf-receipt-mention",
+   "tags": [
+    "v1.7"
+   ],
+   "household": "confirmed",
+   "message": "I have the receipt as a pdf, can I send it here?",
+   "expect": {
+    "intent": "expect_receipt",
+    "reply_contains": "pdf"
+   }
+  },
+  {
+   "id": "v17-several-receipts-later",
+   "tags": [
+    "v1.7"
+   ],
+   "household": "confirmed",
+   "message": "I have 3 receipts from the market, will send them tonight",
+   "expect": {
+    "intent": "expect_receipt"
+   }
   }
  ]
 }

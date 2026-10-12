@@ -87,6 +87,7 @@ def test_checker_passes_a_router_that_returns_exactly_the_expected_decision(case
     e = case["expect"]
     raw = {"intent": e.get("intent", "smalltalk"), "confidence": 0.95, "item_number": e.get("item_number"),
            "item_name": e.get("item_name_contains"),
+           "reply": e.get("reply_contains"),
            "verdict": e.get("verdict"), "remember": ["x"] if e.get("remembers") else []}
     if "price" in e or (e.get("category") and e.get("intent") != "spending_question"):
         raw["patch"] = {"price": e.get("price"), "category": e.get("category")}

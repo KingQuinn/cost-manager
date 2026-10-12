@@ -246,7 +246,7 @@ class WhatsAppClient:
     # Outbound — download an image (by media ID) sent to the bot
     # ------------------------------------------------------------------
     def download_image(self, media_id: str) -> bytes:
-        """Given a WhatsApp media ID (from an inbound image message), fetch the raw bytes."""
+        """Given a WhatsApp media ID (an inbound photo or document), fetch the raw bytes."""
         if not self.is_configured:
             raise RuntimeError(
                 "Cannot download WhatsApp image without WHATSAPP_ACCESS_TOKEN + PHONE_NUMBER_ID."
@@ -303,6 +303,17 @@ class WhatsAppClient:
                         item.image_id = (msg.get("image") or {}).get("id")
                         # Caller is responsible for calling download_image if
                         # the actual bytes are needed.
+                        messages.append(item)
+                    elif msg_type == "document":
+                        # Receipts also arrive as files: a PDF e-receipt, or a photo
+                        # sent "as document". Gemini reads both like a photo.
+                        doc = msg.get("document") or {}
+                        mime = (doc.get("mime_type") or "").split(";")[0].strip().lower()
+                        if mime == "application/pdf" or mime.startswith("image/"):
+                            item.image_id = doc.get("id")
+                            item.media_mime = mime
+                        else:
+                            item.unsupported_document = doc.get("filename") or mime or "that file"
                         messages.append(item)
                     else:
                         # Audio, video, sticker, location, contact, etc. We ignore

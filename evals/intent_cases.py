@@ -72,6 +72,7 @@ def decision_summary(d: Any) -> dict:
         "item": d.query.item if d.query else None,
         "item_terms": [t.lower() for t in d.query.item_terms] if d.query else [],
         "purchase_total": total,
+        "reply": d.reply,
         "remembers": bool(d.remember),
         "confidence": d.confidence,
         "source": d.source,
