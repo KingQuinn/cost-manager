@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from datetime import date
 from decimal import Decimal
@@ -9,9 +10,11 @@ from uuid import UUID
 from app.models import (
     Category,
     Clarification,
+    ConversationTurn,
     Family,
     LineItem,
     Member,
+    MemberMemory,
     Receipt,
     ReceiptStatus,
     WeeklySummary,
@@ -53,6 +56,18 @@ class DataStore(ABC):
     def update_receipt_status(self, receipt_id: UUID, status: str) -> None: ...
 
     @abstractmethod
+    def update_receipt(
+        self,
+        receipt_id: UUID,
+        *,
+        vendor: Optional[str] = None,
+        purchase_date: Optional[date] = None,
+        total: Optional[Decimal] = None,
+        raw_extraction: Optional[dict] = None,
+    ) -> None:
+        """Patch receipt fields (used when a member describes an unreadable receipt in words)."""
+
+    @abstractmethod
     def list_receipts(
         self,
         family_id: Optional[UUID] = None,
@@ -92,7 +107,47 @@ class DataStore(ABC):
     ) -> Optional[Clarification]: ...
 
     @abstractmethod
+    def list_open_clarifications_for_member(self, member_id: UUID) -> list[Clarification]:
+        """Every unresolved clarification on this member's receipts, oldest first.
+
+        The conversation agent matches a reply to one of these by item number —
+        never by "whichever row the database returns first" (architecture.md v1.5).
+        """
+
+    @abstractmethod
     def resolve_clarification(self, clarification_id: UUID, answer: str) -> Clarification: ...
+
+    # ---- conversation memory (architecture.md §7.7) -------------------------
+    # Layer 2 — conversation state: recent chat turns.
+    @abstractmethod
+    def add_conversation_turn(self, turn: ConversationTurn) -> ConversationTurn: ...
+
+    @abstractmethod
+    def list_conversation_turns(
+        self, member_id: UUID, limit: Optional[int] = None
+    ) -> list[ConversationTurn]:
+        """The member's most recent `limit` turns (all if None), oldest first."""
+
+    @abstractmethod
+    def delete_conversation_turns(self, turn_ids: list[UUID]) -> None: ...
+
+    # Layer 2 — conversation state: small JSON blob per member.
+    @abstractmethod
+    def get_member_state(self, member_id: UUID) -> dict: ...
+
+    @abstractmethod
+    def save_member_state(self, member_id: UUID, state: dict) -> None: ...
+
+    # Layer 3 — long-term memory: durable facts + rolling conversation summary.
+    @abstractmethod
+    def list_member_memories(self, member_id: UUID) -> list[MemberMemory]:
+        """All of a member's long-term memories, oldest first."""
+
+    @abstractmethod
+    def add_member_memory(self, memory: MemberMemory) -> MemberMemory: ...
+
+    @abstractmethod
+    def delete_member_memory(self, memory_id: UUID) -> None: ...
 
     # ---- weekly summaries -------------------------------------------------
     @abstractmethod
@@ -100,6 +155,54 @@ class DataStore(ABC):
 
     @abstractmethod
     def list_weekly_summaries(self, family_id: UUID) -> list[WeeklySummary]: ...
+
+    # ---- lookups for the conversation agent ---------------------------------
+    @abstractmethod
+    def latest_receipt_for_member(self, member_id: UUID) -> Optional[Receipt]:
+        """The member's most recently logged receipt (one query, no family scan)."""
+
+    @abstractmethod
+    def find_member_line_items(
+        self, member_id: UUID, words: list[str], limit: int = 50
+    ) -> list[tuple[LineItem, Receipt]]:
+        """Items on this member's receipts whose name contains every word
+        (case-insensitive), newest receipt first. Used to edit an item by name
+        when it isn't on the last receipt or its number isn't known."""
+
+    @abstractmethod
+    def remove_category_keywords(self, category_id: UUID, keywords: list[str]) -> None:
+        """Drop keywords from a category (case-insensitive). Used when a member
+        moves an item out of a category the rules table put it in."""
+
+    # ---- spending questions (architecture.md §7.6) ---------------------------
+    @abstractmethod
+    def spending_breakdown(
+        self,
+        family_id: UUID,
+        *,
+        member_id: Optional[UUID] = None,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        category_id: Optional[UUID] = None,
+        item_terms: Optional[list[str]] = None,
+    ) -> dict:
+        """Totals for a spending question, computed by the database.
+
+        Supabase runs the `spending_breakdown` SQL function
+        (supabase/migrations/0003); the in-memory store mirrors it. Shape, with
+        every amount a Decimal:
+          {"total", "confirmed_receipts",
+           "by_category": [{"name", "amount"}], "by_member": [{"name", "amount"}],
+           "top_vendors": [{"name", "amount", "receipts"}],
+           "top_items": [{"item", "amount", "category", "vendor", "date"}],
+           "first_date", "last_date",   # purchase dates of the matching items
+           "pending_receipts", "pending_amount"}
+        `item_terms` matches an item if its name contains any term once both
+        are lowercased with spaces and punctuation removed ("doughnut" matches
+        "DE PRINCE DOUGH NUT").
+        Only confirmed receipts count toward totals; needs_review ones are
+        reported separately (architecture.md §9).
+        """
 
     # ---- aggregate helpers -------------------------------------------------
     def all_confirmed_line_items(
@@ -121,3 +224,30 @@ class DataStore(ABC):
                     continue
                 out.append((li, cat, member))
         return out
+
+
+def normalize_breakdown(raw: dict) -> dict:
+    """Coerce a spending_breakdown result (e.g. JSON numbers from PostgREST) to Decimals."""
+    def dec(v) -> Decimal:
+        return Decimal(str(v if v is not None else 0)).quantize(Decimal("0.01"))
+
+    def rows(key: str) -> list[dict]:
+        return [{**r, "amount": dec(r.get("amount"))} for r in (raw.get(key) or [])]
+
+    return {
+        "total": dec(raw.get("total")),
+        "confirmed_receipts": int(raw.get("confirmed_receipts") or 0),
+        "by_category": rows("by_category"),
+        "by_member": rows("by_member"),
+        "top_vendors": [{**r, "receipts": int(r.get("receipts") or 0)} for r in rows("top_vendors")],
+        "top_items": [{**r, "date": str(r.get("date"))} for r in rows("top_items")],
+        "first_date": str(raw["first_date"]) if raw.get("first_date") else None,
+        "last_date": str(raw["last_date"]) if raw.get("last_date") else None,
+        "pending_receipts": int(raw.get("pending_receipts") or 0),
+        "pending_amount": dec(raw.get("pending_amount")),
+    }
+
+
+def squash(text: str) -> str:
+    """Lowercase, letters and digits only: how item names and search terms are compared."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())  # same rule as the SQL function

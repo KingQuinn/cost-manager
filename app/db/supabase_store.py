@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from app.db.base import DataStore
-from app.models import Category, Clarification, Family, LineItem, Member, Receipt, WeeklySummary
+from app.db.base import DataStore, normalize_breakdown, squash
+from app.models import (
+    Category,
+    Clarification,
+    ConversationTurn,
+    Family,
+    LineItem,
+    Member,
+    MemberMemory,
+    Receipt,
+    WeeklySummary,
+)
 
 
 class SupabaseStore(DataStore):
@@ -83,6 +93,27 @@ class SupabaseStore(DataStore):
     def update_receipt_status(self, receipt_id: UUID, status: str) -> None:
         self._client.table("receipts").update({"status": status}).eq("id", str(receipt_id)).execute()
 
+    def update_receipt(
+        self,
+        receipt_id: UUID,
+        *,
+        vendor: Optional[str] = None,
+        purchase_date: Optional[date] = None,
+        total: Optional[Decimal] = None,
+        raw_extraction: Optional[dict] = None,
+    ) -> None:
+        payload: dict = {}
+        if vendor is not None:
+            payload["vendor"] = vendor
+        if purchase_date is not None:
+            payload["purchase_date"] = purchase_date.isoformat()
+        if total is not None:
+            payload["total"] = float(total)
+        if raw_extraction is not None:
+            payload["raw_extraction"] = raw_extraction
+        if payload:
+            self._client.table("receipts").update(payload).eq("id", str(receipt_id)).execute()
+
     def list_receipts(
         self,
         family_id: Optional[UUID] = None,
@@ -120,7 +151,13 @@ class SupabaseStore(DataStore):
         return [LineItem(**row) for row in r.data]
 
     def list_line_items(self, receipt_id: UUID) -> list[LineItem]:
-        r = self._client.table("line_items").select("*").eq("receipt_id", str(receipt_id)).execute()
+        r = (
+            self._client.table("line_items")
+            .select("*")
+            .eq("receipt_id", str(receipt_id))
+            .order("position")
+            .execute()
+        )
         return [LineItem(**row) for row in r.data]
 
     def update_line_item(
@@ -179,6 +216,18 @@ class SupabaseStore(DataStore):
         )
         return Clarification(**r.data[0]) if r.data else None
 
+    def list_open_clarifications_for_member(self, member_id: UUID) -> list[Clarification]:
+        # One round trip: filter through the receipt join instead of fetching ids first.
+        r = (
+            self._client.table("clarifications")
+            .select("*, receipts!inner(member_id)")
+            .eq("receipts.member_id", str(member_id))
+            .eq("resolved", False)
+            .order("created_at")
+            .execute()
+        )
+        return [Clarification(**{k: v for k, v in row.items() if k != "receipts"}) for row in r.data]
+
     def resolve_clarification(self, clarification_id: UUID, answer: str) -> Clarification:
         r = (
             self._client.table("clarifications")
@@ -188,6 +237,130 @@ class SupabaseStore(DataStore):
             .execute()
         )
         return Clarification(**r.data[0])
+
+    # ---------- conversation memory (tables from migrations/0002) ----------
+    def add_conversation_turn(self, turn: ConversationTurn) -> ConversationTurn:
+        r = self._client.table("conversation_turns").insert(turn.model_dump(mode="json")).execute()
+        return ConversationTurn(**r.data[0])
+
+    def list_conversation_turns(
+        self, member_id: UUID, limit: Optional[int] = None
+    ) -> list[ConversationTurn]:
+        q = (
+            self._client.table("conversation_turns")
+            .select("*")
+            .eq("member_id", str(member_id))
+            .order("created_at", desc=True)
+        )
+        if limit:
+            q = q.limit(limit)
+        rows = q.execute().data
+        return [ConversationTurn(**row) for row in reversed(rows)]
+
+    def delete_conversation_turns(self, turn_ids: list[UUID]) -> None:
+        if turn_ids:
+            self._client.table("conversation_turns").delete().in_(
+                "id", [str(t) for t in turn_ids]
+            ).execute()
+
+    def get_member_state(self, member_id: UUID) -> dict:
+        r = (
+            self._client.table("member_state")
+            .select("state")
+            .eq("member_id", str(member_id))
+            .limit(1)
+            .execute()
+        )
+        return dict(r.data[0].get("state") or {}) if r.data else {}
+
+    def save_member_state(self, member_id: UUID, state: dict) -> None:
+        self._client.table("member_state").upsert(
+            {"member_id": str(member_id), "state": state, "updated_at": datetime.now(timezone.utc).isoformat()},
+            on_conflict="member_id",
+        ).execute()
+
+    def list_member_memories(self, member_id: UUID) -> list[MemberMemory]:
+        r = (
+            self._client.table("member_memories")
+            .select("*")
+            .eq("member_id", str(member_id))
+            .order("created_at")
+            .execute()
+        )
+        return [MemberMemory(**row) for row in r.data]
+
+    def add_member_memory(self, memory: MemberMemory) -> MemberMemory:
+        r = self._client.table("member_memories").insert(memory.model_dump(mode="json")).execute()
+        return MemberMemory(**r.data[0])
+
+    def delete_member_memory(self, memory_id: UUID) -> None:
+        self._client.table("member_memories").delete().eq("id", str(memory_id)).execute()
+
+    # ---------- lookups for the conversation agent ----------
+    def latest_receipt_for_member(self, member_id: UUID) -> Optional[Receipt]:
+        r = (
+            self._client.table("receipts").select("*").eq("member_id", str(member_id))
+            .order("created_at", desc=True).limit(1).execute()
+        )
+        return Receipt(**r.data[0]) if r.data else None
+
+    def find_member_line_items(
+        self, member_id: UUID, words: list[str], limit: int = 50
+    ) -> list[tuple[LineItem, Receipt]]:
+        want = [w for w in (squash(x) for x in words) if w]
+        if not want:
+            return []
+        # One round trip: items joined to their receipt, filtered to this member and
+        # narrowed in SQL by the start of the longest word (so "doughnut" still
+        # finds "DOUGH NUT"); the exact squashed all-words check runs here.
+        prefix = max(want, key=len)[:4]
+        r = (
+            self._client.table("line_items")
+            .select("*, receipts!inner(*)")
+            .eq("receipts.member_id", str(member_id))
+            .ilike("name", f"%{prefix}%")
+            .limit(500)
+            .execute()
+        )
+        out = []
+        for row in r.data:
+            receipt = Receipt(**row.pop("receipts"))
+            li = LineItem(**row)
+            if all(w in squash(li.name) for w in want):
+                out.append((li, receipt))
+        out.sort(key=lambda pair: (pair[1].created_at, -pair[0].position), reverse=True)
+        return out[:limit]
+
+    def remove_category_keywords(self, category_id: UUID, keywords: list[str]) -> None:
+        cur = self._client.table("categories").select("keywords").eq("id", str(category_id)).single().execute()
+        existing = list(cur.data.get("keywords") or [])
+        drop = {k.lower() for k in keywords}
+        kept = [k for k in existing if k.lower() not in drop]
+        if len(kept) != len(existing):
+            self._client.table("categories").update({"keywords": kept}).eq("id", str(category_id)).execute()
+
+    # ---------- spending questions ----------
+    def spending_breakdown(
+        self,
+        family_id: UUID,
+        *,
+        member_id: Optional[UUID] = None,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+        category_id: Optional[UUID] = None,
+        item_terms: Optional[list[str]] = None,
+    ) -> dict:
+        # One round trip; the SQL function does all the summing (migrations/0004).
+        terms = [t for t in (squash(x) for x in item_terms or []) if t]
+        r = self._client.rpc("spending_breakdown", {
+            "p_family_id": str(family_id),
+            "p_member_id": str(member_id) if member_id else None,
+            "p_start": start.isoformat() if start else None,
+            "p_end": end.isoformat() if end else None,
+            "p_category_id": str(category_id) if category_id else None,
+            "p_items": terms or None,
+        }).execute()
+        return normalize_breakdown(r.data or {})
 
     # ---------- weekly summaries ----------
     def create_weekly_summary(self, summary: WeeklySummary) -> WeeklySummary:

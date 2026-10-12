@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
-from typing import NamedTuple, Optional
+from typing import Iterator, NamedTuple, Optional
 
 import httpx
 
@@ -61,6 +64,9 @@ class WhatsAppClient:
         self.phone_number_id = phone_number_id or settings.whatsapp_phone_number_id
         self.verify_token = verify_token or settings.whatsapp_verify_token
         self.app_secret = app_secret or settings.whatsapp_app_secret
+        # Active "typing..." keepalives, per recipient phone (see typing()).
+        self._typing_lock = threading.Lock()
+        self._typing_sessions: dict[str, list[tuple[threading.Event, threading.Thread]]] = {}
 
     @property
     def is_configured(self) -> bool:
@@ -90,6 +96,9 @@ class WhatsAppClient:
     # ------------------------------------------------------------------
     def send_text(self, to_phone: str, text: str) -> dict:
         """Send a plain text message to a single recipient (E.164 phone number)."""
+        # A reply ends "typing..." on WhatsApp. Stop our keepalive first so a
+        # late refresh can't land after this message and show it again.
+        self.stop_typing(to_phone)
         if not self.is_configured:
             logger.info(
                 "[WHATSAPP STUB] send_text to=%s:\n%s", to_phone, text
@@ -120,10 +129,124 @@ class WhatsAppClient:
             raise
 
     # ------------------------------------------------------------------
+    # Outbound — "typing..." indicator while the bot works on a reply
+    # ------------------------------------------------------------------
+    # Meta hides the indicator when we send a reply, or after ~25s, whichever
+    # comes first. Gemini can take longer than that on a faded receipt or a
+    # multi-page PDF, so typing() re-sends it every TYPING_REFRESH_SECONDS.
+    TYPING_REFRESH_SECONDS = 20.0  # must stay under Meta's ~25s timeout
+    TYPING_MAX_SECONDS = 60.0      # give up after this; endless typing is bad UX
+    TYPING_REQUEST_TIMEOUT = 5.0
+
+    def send_typing_indicator(self, message_id: str) -> bool:
+        """Mark an inbound message as read and show "typing..." to its sender.
+
+        `message_id` must be the ID of a message the user sent us
+        (WhatsAppInboundMessage.message_id), not one we sent.
+        Never raises: the indicator is cosmetic, so a failure here must never
+        stop a receipt from being processed. Returns True if Meta accepted it.
+        """
+        if not message_id:
+            return False
+        if not self.is_configured:
+            logger.info("[WHATSAPP STUB] typing indicator for message_id=%s", message_id)
+            return True
+
+        url = (
+            f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
+            f"{self.phone_number_id}/messages"
+        )
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": message_id,
+            "typing_indicator": {"type": "text"},
+        }
+        try:
+            r = httpx.post(url, headers=headers, json=payload, timeout=self.TYPING_REQUEST_TIMEOUT)
+        except httpx.HTTPError as e:
+            logger.warning("WhatsApp typing indicator failed: %s", e.__class__.__name__)
+            return False
+        if r.status_code >= 400:
+            logger.warning(
+                "WhatsApp typing indicator rejected (%s): %s", r.status_code, r.text[:300]
+            )
+            return False
+        return True
+
+    @contextmanager
+    def typing(self, message_id: str, to_phone: str) -> Iterator[None]:
+        """Show "typing..." to `to_phone` until the block ends or we message them.
+
+            with wa.typing(msg.message_id, msg.from_phone):
+                process_inbound_message(...)   # may call send_text itself
+
+        The indicator stops at whichever comes first: the block exiting, or
+        send_text() to the same phone. So the pipeline can send its reply from
+        inside the block, and any work after the reply won't bring "typing..." back.
+
+        Runs in a background thread, so it works from sync code and async routes.
+        """
+        stop = threading.Event()
+
+        def keepalive() -> None:
+            started = time.monotonic()
+            if stop.is_set():
+                return  # reply already went out before we started
+            if not self.send_typing_indicator(message_id):
+                return  # first call failed: don't keep retrying
+            while True:
+                remaining = self.TYPING_MAX_SECONDS - (time.monotonic() - started)
+                if remaining <= 0:
+                    logger.info(
+                        "Typing indicator reached %.0fs cap; stopping", self.TYPING_MAX_SECONDS
+                    )
+                    return
+                if stop.wait(timeout=min(self.TYPING_REFRESH_SECONDS, remaining)):
+                    return  # work finished
+                if time.monotonic() - started < self.TYPING_MAX_SECONDS:
+                    self.send_typing_indicator(message_id)
+
+        thread = threading.Thread(target=keepalive, name="whatsapp-typing", daemon=True)
+        session = (stop, thread)
+        with self._typing_lock:
+            self._typing_sessions.setdefault(to_phone, []).append(session)
+        thread.start()
+        try:
+            yield
+        finally:
+            with self._typing_lock:
+                sessions = self._typing_sessions.get(to_phone, [])
+                if session in sessions:
+                    sessions.remove(session)
+                if not sessions:
+                    self._typing_sessions.pop(to_phone, None)
+            self._end_typing_session(session)
+
+    def stop_typing(self, to_phone: str) -> None:
+        """Stop every active "typing..." keepalive for `to_phone`. Safe to call anytime."""
+        with self._typing_lock:
+            sessions = self._typing_sessions.pop(to_phone, [])
+        for session in sessions:
+            self._end_typing_session(session)
+
+    def _end_typing_session(self, session: tuple[threading.Event, threading.Thread]) -> None:
+        stop, thread = session
+        stop.set()
+        # Wait for an in-flight indicator request to finish, so it can't reach
+        # Meta after the reply we're about to send.
+        if thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=self.TYPING_REQUEST_TIMEOUT + 1)
+
+    # ------------------------------------------------------------------
     # Outbound — download an image (by media ID) sent to the bot
     # ------------------------------------------------------------------
     def download_image(self, media_id: str) -> bytes:
-        """Given a WhatsApp media ID (from an inbound image message), fetch the raw bytes."""
+        """Given a WhatsApp media ID (an inbound photo or document), fetch the raw bytes."""
         if not self.is_configured:
             raise RuntimeError(
                 "Cannot download WhatsApp image without WHATSAPP_ACCESS_TOKEN + PHONE_NUMBER_ID."
@@ -180,6 +303,17 @@ class WhatsAppClient:
                         item.image_id = (msg.get("image") or {}).get("id")
                         # Caller is responsible for calling download_image if
                         # the actual bytes are needed.
+                        messages.append(item)
+                    elif msg_type == "document":
+                        # Receipts also arrive as files: a PDF e-receipt, or a photo
+                        # sent "as document". Gemini reads both like a photo.
+                        doc = msg.get("document") or {}
+                        mime = (doc.get("mime_type") or "").split(";")[0].strip().lower()
+                        if mime == "application/pdf" or mime.startswith("image/"):
+                            item.image_id = doc.get("id")
+                            item.media_mime = mime
+                        else:
+                            item.unsupported_document = doc.get("filename") or mime or "that file"
                         messages.append(item)
                     else:
                         # Audio, video, sticker, location, contact, etc. We ignore

@@ -13,7 +13,7 @@ from app.models import DEFAULT_CATEGORIES, ExtractedLineItem, ExtractionResult
 logger = logging.getLogger(__name__)
 
 EXTRACTION_SYSTEM_PROMPT = """\
-You are a receipt data extraction system. Given a photo of a receipt, extract \
+You are a receipt data extraction system. Given a photo or PDF of a receipt, extract \
 structured data. Respond ONLY with valid JSON matching the schema below — \
 no markdown fences, no commentary, no explanation.
 
@@ -51,9 +51,27 @@ explain in extraction_notes.
 _CATEGORY_PROMPT_TEMPLATE = """\
 You are a categorizer for a family expense tracker. Given the name of a single \
 purchase line item, assign it to exactly one category from this list: \
-{category_list}. Respond with ONLY the category name, nothing else.
+{category_list}. Drinks means ready-to-drink beverages (water, soft drinks, juice, malt, \
+energy drinks, bottled tea, beer, wine, zobo, kunu, fura drink). Things you \
+cook with or prepare a drink from (milk, tea bags, coffee, Milo powder) are \
+Groceries. Respond with ONLY the category name, nothing else.
 
 Line item name: "{item_name}"
+"""
+
+
+_BATCH_CATEGORY_PROMPT_TEMPLATE = """\
+You are a categorizer for a family expense tracker in Nigeria. Assign each \
+purchase line item below to exactly one category from this list: \
+{category_list}. Receipt names are often abbreviated or misspelled. Drinks means ready-to-drink beverages (water, soft drinks, juice, malt, \
+energy drinks, bottled tea, beer, wine, zobo, kunu, fura drink). Things you \
+cook with or prepare a drink from (milk, tea bags, coffee, Milo powder) are \
+Groceries.
+
+Return ONLY a JSON object mapping each item name, copied exactly, to its category name.
+
+Line items:
+{items}
 """
 
 
@@ -191,7 +209,9 @@ def extract_receipt(
         # Tiny magic-number fallback for JPEG/PNG — enough for WhatsApp images
         # which are almost always JPEG.  mimetypes.guess_type on bytes isn't
         # a real API, so do this manually.
-        if image_bytes.startswith(b"\xff\xd8\xff"):
+        if image_bytes.startswith(b"%PDF"):
+            mime_hint = "application/pdf"
+        elif image_bytes.startswith(b"\xff\xd8\xff"):
             mime_hint = "image/jpeg"
         elif image_bytes.startswith(b"\x89PNG"):
             mime_hint = "image/png"
@@ -200,9 +220,9 @@ def extract_receipt(
         else:
             mime_hint = "image/jpeg"
 
-    model = _gemini_model(model_name)
-
     import base64
+
+    from app.services import llm
 
     prompt = [
         EXTRACTION_SYSTEM_PROMPT,
@@ -210,8 +230,10 @@ def extract_receipt(
     ]
 
     logger.info("Calling Gemini extract_receipt (%d bytes, %s)", len(image_bytes), mime_hint)
-    response = model.generate_content(prompt, request_options={"timeout": 60})
-    text = response.text if hasattr(response, "text") else ""
+    text = llm.generate(
+        "extract-receipt", prompt, model_name=model_name, timeout=60,
+        metadata={"image_bytes": len(image_bytes), "mime": mime_hint},
+    )
     logger.debug("Gemini raw extraction response: %s", text)
 
     cleaned = _clean_json_response(text)
@@ -243,10 +265,11 @@ def categorize_with_llm(item_name: str) -> str:
         item_name=item_name,
     )
 
-    model = _gemini_model()
+    from app.services import llm
+
     logger.info("Calling Gemini categorize_with_llm for %r", item_name)
-    response = model.generate_content([prompt], request_options={"timeout": 30})
-    raw = (response.text if hasattr(response, "text") else "").strip().strip('"').strip("'")
+    text = llm.generate("categorize-item", [prompt], model_name="gemini-3.5-flash-lite", timeout=30)
+    raw = (text or "").strip().strip('"').strip("'")
     raw_lc = raw.lower()
     if raw_lc in allowed_lc:
         return allowed_lc[raw_lc]
@@ -257,3 +280,29 @@ def categorize_with_llm(item_name: str) -> str:
             return name
     logger.warning("LLM categorizer returned %r for %r; using Other", raw, item_name)
     return "Other"
+
+
+def categorize_many_with_llm(item_names: list[str]) -> dict[str, str]:
+    """One Gemini call for every item the keyword rules couldn't place.
+
+    A 35-item receipt used to make 14 separate calls (~18s, and more than the
+    free tier's 15 requests a minute). Returns {item_name: category}; any item
+    the model skips or labels with an unknown category becomes "Other".
+    """
+    names = list(dict.fromkeys(n for n in item_names if n))
+    if not names:
+        return {}
+    allowed = [name for name, _ in DEFAULT_CATEGORIES]
+    allowed_lc = {name.lower(): name for name in allowed}
+    prompt = _BATCH_CATEGORY_PROMPT_TEMPLATE.format(
+        category_list=", ".join(allowed),
+        items="\n".join(f"- {json.dumps(n, ensure_ascii=False)}" for n in names),
+    )
+    from app.services import llm
+
+    raw = llm.generate_json("categorize-items", [prompt], model_name="gemini-3.5-flash-lite", timeout=30)
+    by_lc = {str(k).strip().lower(): str(v).strip().lower() for k, v in raw.items()}
+    out = {}
+    for n in names:
+        out[n] = allowed_lc.get(by_lc.get(n.strip().lower(), ""), "Other")
+    return out

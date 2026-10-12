@@ -22,25 +22,57 @@ def build_default_categories() -> list[Category]:
     return [Category(name=name, keywords=list(keywords)) for name, keywords in DEFAULT_CATEGORIES]
 
 
+MIN_KEYWORD_LEN = 3
+
+# Words that say nothing about what an item is. Learned keywords used to include
+# "k", "g", "per", "pack", "500ml" and similar, which matched almost anything.
+_NOISE_WORDS = {
+    "the", "and", "for", "with", "per", "pack", "piece", "pcs", "pkt", "kilo", "kilogram",
+    "var", "variety", "varieties", "assorted", "original", "special", "real", "fresh",
+    "big", "small", "mini", "medium", "large", "plus", "new", "red", "green", "blue",
+    "black", "white", "pet", "can", "tin", "bottle", "sachet", "carton", "each",
+}
+_UNIT_RE = re.compile(r"^\d+([.,]\d+)?(ml|l|cl|g|kg|mg|oz|pcs|pc|x)?$|^#?\d+$|^\d+[a-z]{0,3}$")
+
+
+def keyword_tokens(item_name: str) -> list[str]:
+    """Words from an item name worth learning as category keywords: at least
+    3 characters, not a size/unit ("500ml", "45cl"), not filler ("per", "pack")."""
+    return [
+        t for t in _tokenize(item_name)
+        if len(t) >= MIN_KEYWORD_LEN and t not in _NOISE_WORDS and not _UNIT_RE.match(t)
+    ]
+
+
+def _keyword_matches(kw: str, name_lc: str) -> bool:
+    # Keyword must start a word: "cola" matches "american cola" but not "chocolate";
+    # truncated receipt words still match ("mayonnais" in "mayonnaise").
+    return re.search(r"(?<![a-z0-9])" + re.escape(kw), name_lc) is not None
+
+
 def categorize_by_rules(
     item_name: str,
     categories: list[Category],
 ) -> Optional[Category]:
-    """Rules-first categorization: substring match on keywords. First match wins.
+    """Rules-first categorization against each category's keywords.
 
-    Lowercase both the item name and the keyword before comparing. Checks for
-    substring match (not whole-word) so that e.g. a keyword of "shoprite"
-    matches a line item "Shoprite Supermarket Ikeja".
+    A keyword matches when it starts a word in the item name (case-insensitive),
+    e.g. "shoprite" matches "Shoprite Supermarket Ikeja". If keywords from
+    several categories match, the longest keyword wins ("ice tea" beats "tea"),
+    so the answer doesn't depend on the order categories come back from the DB.
+    Keywords shorter than 3 characters are ignored.
     """
     name_lc = (item_name or "").lower()
+    best: Optional[Category] = None
+    best_len = 0
     for category in categories:
         for kw in category.keywords:
-            kw_lc = (kw or "").lower()
-            if not kw_lc:
+            kw_lc = (kw or "").strip().lower()
+            if len(kw_lc) < MIN_KEYWORD_LEN or len(kw_lc) <= best_len:
                 continue
-            if kw_lc in name_lc:
-                return category
-    return None
+            if _keyword_matches(kw_lc, name_lc):
+                best, best_len = category, len(kw_lc)
+    return best
 
 
 def _dedupe_append(existing: list[str], new: list[str]) -> list[str]:
@@ -83,7 +115,7 @@ def categorize_item(
         # Shouldn't happen (categorize_with_llm guarantees allowed list), but be safe.
         assigned = next((c for c in categories if c.name == "Other"), categories[-1])
 
-    tokens = _tokenize(item_name)
+    tokens = keyword_tokens(item_name)
     if tokens and persist_keywords is not None:
         try:
             persist_keywords(assigned.id, tokens)

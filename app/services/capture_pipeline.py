@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import logging
-import re
 from decimal import Decimal
 from typing import Optional
 
+from app import observability
 from app.config import get_settings
 from app.db import DataStore
 from app.models import Category, Clarification, LineItem, Receipt, ReceiptStatus, WhatsAppInboundMessage
-from app.services.categorize import categorize_item
-from app.services.extraction import categorize_with_llm, extract_receipt
+from app.services.agent import ConversationAgent, format_receipt
+from app.services.categorize import categorize_by_rules, categorize_item
+from app.services.extraction import categorize_many_with_llm, extract_receipt
+from app.services.memory import ConversationMemory
+from app.services.spending import format_ngn
 from app.services.whatsapp import WhatsAppClient
 
 logger = logging.getLogger(__name__)
@@ -27,10 +30,19 @@ def mark_pending_onboard(phone: str) -> None:
     _PENDING_ONBOARD[phone] = True
 
 
-def _format_ngn(n: Decimal) -> str:
-    q = n.quantize(Decimal("0.01"))
-    s = f"{q:,.2f}" if q != q.to_integral() else f"{q:,.0f}"
-    return f"₦{s}"
+_format_ngn = format_ngn  # kept for older imports
+
+
+def _llm_categories(names: list[str]) -> dict[str, str]:
+    """Categories for items the rules missed. If Gemini fails they become "Other"
+    (members can move them later), so a receipt is never dropped."""
+    if not names:
+        return {}
+    try:
+        return categorize_many_with_llm(names)
+    except Exception as e:
+        logger.warning("Batch categorization failed for %d item(s), using Other: %s", len(names), e)
+        return {n: "Other" for n in names}
 
 
 class CapturePipeline:
@@ -44,6 +56,8 @@ class CapturePipeline:
     def __init__(self, store: DataStore, whatsapp: WhatsAppClient) -> None:
         self.store = store
         self.whatsapp = whatsapp
+        self.memory = ConversationMemory(store)
+        self.agent = ConversationAgent(store, whatsapp)
         settings = get_settings()
         self.overall_conf_threshold = settings.overall_confidence_threshold
         self.per_item_conf_threshold = settings.per_item_confidence_threshold
@@ -63,13 +77,15 @@ class CapturePipeline:
         _PENDING_ONBOARD.pop(phone, None)
 
     # ---- image receipt processing ----------------------------------------
-    def process_image(self, from_phone: str, image_bytes: bytes, image_id: str) -> str:
-        """Core capture: extraction → categorize → persist → reply. Returns a summary string for testing."""
+    def process_image(self, from_phone: str, image_bytes: bytes, image_id: str,
+                      mime: Optional[str] = None) -> str:
+        """Core capture: extraction → categorize → persist → reply. Returns a summary string for testing.
+        `image_bytes` may be a photo or a PDF receipt (`mime` from WhatsApp, else sniffed)."""
         member = self.store.get_member_by_phone(from_phone)
         if member is None:
             return "[process_image called on unknown phone"
 
-        extraction = extract_receipt(image_bytes)
+        extraction = extract_receipt(image_bytes, mime)
         raw_extraction = extraction.model_dump(mode="json")
 
         if extraction.overall_confidence == 0:
@@ -83,12 +99,17 @@ class CapturePipeline:
                 status=ReceiptStatus.NEEDS_REVIEW,
                 raw_extraction=raw_extraction,
             )
-            self.store.create_receipt(receipt)
+            receipt = self.store.create_receipt(receipt)
             msg = (
                 "Hmm, I couldn't tell that was a receipt (the words were too unclear or it isn't one). "
-                "Could you try another photo, or describe the purchase in words?"
+                "Could you try another photo, or describe the purchase in words "
+                "(e.g. 'bought 2 crates of eggs for 4500 at Shoprite')?"
             )
-            self.whatsapp.send_text(from_phone, msg)
+            # Layer 2 memory: the next text is probably that description. The agent
+            # logs it as a purchase onto this receipt — never as an edit to another one.
+            self.memory.clear_state(member.id, "pending_action")
+            self.memory.set_state(member.id, "awaiting_description", {"receipt_id": str(receipt.id)})
+            self._send_and_remember(member.id, from_phone, msg)
             return msg
 
         categories = self.store.list_categories()
@@ -101,17 +122,27 @@ class CapturePipeline:
             status=ReceiptStatus.PENDING,  # updated after confidence check
             raw_extraction=raw_extraction,
         )
-        self.store.create_receipt(receipt)
+        receipt = self.store.create_receipt(receipt)
+        # A readable receipt arrived: we're no longer waiting on a typed description,
+        # and any proposed edit (which pointed at the previous "last receipt") is void.
+        self.memory.clear_state(member.id, "awaiting_description", "pending_action")
+        self.memory.record(member.id, "user", f"[sent a receipt photo from {extraction.vendor or 'unknown vendor'}]")
 
         # ---- build line items + categorize each ------------------------------------
         line_items: list[LineItem] = []
         low_conf_extracted_items_for_question: list[tuple[int, LineItem, str]] = []
         # index (1-based) used in chat UX
 
+        # Items the keyword rules can't place go to Gemini together in ONE call
+        # (v1.6 made one call per item: 14 calls / ~18s on a 35-item receipt).
+        # Then categorize in order, so the rules learn from each answer as before.
+        unmatched = [e.name for e in extraction.line_items if categorize_by_rules(e.name, categories) is None]
+        llm_answers = _llm_categories(unmatched)
+
         for idx, ext in enumerate(extraction.line_items, start=1):
             cat, _used_llm = categorize_item(
                 ext.name, categories,
-                llm_fallback=categorize_with_llm,
+                llm_fallback=lambda name: llm_answers.get(name, "Other"),
                 persist_keywords=self.store.append_category_keywords,
             )
             li = LineItem(
@@ -122,6 +153,7 @@ class CapturePipeline:
                 category_id=cat.id,
                 confidence=ext.confidence,
                 needs_review=False,
+                position=idx,
             )
             item_conf_ok = ext.confidence >= self.per_item_conf_threshold
             if not item_conf_ok:
@@ -138,8 +170,9 @@ class CapturePipeline:
 
         if overall_clear and all_items_clear:
             self.store.update_receipt_status(receipt.id, ReceiptStatus.CONFIRMED)
-            msg = self._format_confirmation(saved_items, categories, receipt)
-            self.whatsapp.send_text(from_phone, msg)
+            receipt.status = ReceiptStatus.CONFIRMED
+            msg = format_receipt(saved_items, categories, receipt)
+            self._send_and_remember(member.id, from_phone, msg)
             return msg
 
         # Otherwise: needs review. One targeted clarification for each unclear item
@@ -164,39 +197,24 @@ class CapturePipeline:
             questions.append(q_text)
 
         combined = "\n\n".join(questions)
-        self.whatsapp.send_text(from_phone, combined)
+        if len(questions) > 1:
+            combined += "\n\nPlease start each answer with its item number (e.g. 'ok 2')."
+        self._send_and_remember(member.id, from_phone, combined)
         return combined
 
+    def _send_and_remember(self, member_id, phone: str, text: str) -> None:
+        self.whatsapp.send_text(phone, text)
+        self.memory.record(member_id, "assistant", text)
+
     def _format_confirmation(self, items: list[LineItem], categories: list[Category], receipt: Receipt) -> str:
-        cat_by_id = {c.id: c for c in categories}
-        lines = [f"✅ Logged {len(items)} item(s) from {receipt.vendor or 'this receipt'}.\n"]
-        total = Decimal("0")
-        by_category: dict[str, Decimal] = {}
-        for idx, li in enumerate(items, 1):
-            cat = cat_by_id.get(li.category_id).name if cat_by_id.get(li.category_id) else "Other"
-            lines.append(f"{idx}. {li.name} · {_format_ngn(li.price)} · {cat}")
-            total += li.price
-            by_category[cat] = by_category.get(cat, Decimal("0")) + li.price
-        lines.append("")
-        lines.append(f"Total: {_format_ngn(total)}")
+        return format_receipt(items, categories, receipt)
 
-        if len(by_category) > 1:
-            lines.append("")
-            lines.append("By category:")
-            for cat_name, amt in sorted(by_category.items(), key=lambda kv: -kv[1]):
-                pct = int((amt / total * 100).to_integral()) if total else 0
-                lines.append(f"  {cat_name}: {_format_ngn(amt)} ({pct}%)")
-
-        lines.append("")
-        lines.append("To correct any item, reply e.g. 'item 2 was 2500 and category was Dining'.")
-        return "\n".join(lines)
-
-    # ---- text reply handling (corrections + clarifications + onboarding ------------
+    # ---- text messages: onboarding here, everything else -> conversation agent ----
     def handle_text(self, from_phone: str, text: str) -> str:
         # 1. Onboarding in progress? Text is a name.
         if is_pending_onboard(from_phone):
             self.complete_onboarding(from_phone, text)
-            reply = f"Thanks {text.strip().split()[0]}! Got you down as '{text.strip()} 🙂. Send a receipt photo anytime to log it."
+            reply = f"Thanks {text.strip().split()[0]}! Got you down as '{text.strip()}' 🙂. Send a receipt photo anytime to log it."
             self.whatsapp.send_text(from_phone, reply)
             return reply
 
@@ -208,198 +226,9 @@ class CapturePipeline:
             self.whatsapp.send_text(from_phone, prompt)
             return prompt
 
-        # 2. Open clarification to resolve?
-        cl = self.store.get_open_clarification_for_member(member.id)
-        if cl is not None:
-            return self._resolve_clarification(member, cl, text, from_phone)
-
-        # 3. A known keyword intent (help / recap / running total)? Checked before
-        # the correction parser since none of these contain an item number.
-        intent_reply = self._handle_known_intent(member, text, from_phone)
-        if intent_reply is not None:
-            return intent_reply
-
-        # 4. Correction against most recent confirmed receipt? e.g. "item 2 price was 1500 category groceries"
-        return self._apply_freeform_correction(member, text, from_phone)
-
-    _HELP_TEXT = (
-        "Here's what I can do:\n"
-        "- Send a photo of a receipt to log it\n"
-        "- \"show my items\" — see what's on your last receipt\n"
-        "- \"how much have I spent\" — your running total by category\n"
-        "- \"item 2 price was 2500\" — correct a logged item\n"
-        "- \"help\" — see this again"
-    )
-
-    def _handle_known_intent(self, member, text: str, from_phone: str) -> Optional[str]:
-        """Simple keyword matching — no LLM call, kept intentionally cheap. Checked
-        before the correction parser so plain-English asks don't get mistaken for a
-        failed correction attempt."""
-        t = text.strip().lower()
-
-        if re.search(r"\bhelp\b", t) or t in ("?", "commands"):
-            self.whatsapp.send_text(from_phone, self._HELP_TEXT)
-            return self._HELP_TEXT
-
-        if ("show" in t or "list" in t or "see" in t) and ("item" in t or "log" in t):
-            reply = self._format_last_receipt_recap(member)
-            self.whatsapp.send_text(from_phone, reply)
-            return reply
-
-        if "spent" in t or "spending" in t or "how much" in t:
-            reply = self._format_member_spend(member)
-            self.whatsapp.send_text(from_phone, reply)
-            return reply
-
-        return None
-
-    def _format_last_receipt_recap(self, member) -> str:
-        recent = self.store.list_receipts(family_id=member.family_id)
-        my_recent = [r for r in recent if r.member_id == member.id]
-        if not my_recent:
-            return "You haven't logged any receipts yet — send a photo to get started 🙂."
-        receipt = my_recent[0]
-        items = self.store.list_line_items(receipt.id)
-        categories = self.store.list_categories()
-        return self._format_confirmation(items, categories, receipt)
-
-    def _format_member_spend(self, member) -> str:
-        receipts = [
-            r for r in self.store.list_receipts(family_id=member.family_id, status=ReceiptStatus.CONFIRMED)
-            if r.member_id == member.id
-        ]
-        if not receipts:
-            return "You don't have any confirmed receipts yet — send a photo to log one 🙂."
-
-        categories = self.store.list_categories()
-        cat_by_id = {c.id: c for c in categories}
-        by_category: dict[str, Decimal] = {}
-        total = Decimal("0")
-        for r in receipts:
-            for li in self.store.list_line_items(r.id):
-                cat_name = cat_by_id.get(li.category_id).name if cat_by_id.get(li.category_id) else "Other"
-                by_category[cat_name] = by_category.get(cat_name, Decimal("0")) + li.price
-                total += li.price
-
-        lines = [f"Your spending so far ({len(receipts)} confirmed receipt(s)):", "", f"Total: {_format_ngn(total)}"]
-        if len(by_category) > 1:
-            lines.append("")
-            lines.append("By category:")
-            for name, amt in sorted(by_category.items(), key=lambda kv: -kv[1]):
-                pct = int((amt / total * 100).to_integral()) if total else 0
-                lines.append(f"  {name}: {_format_ngn(amt)} ({pct}%)")
-        return "\n".join(lines)
-
-    def _resolve_clarification(self, member, cl: Clarification, text: str, from_phone: str) -> str:
-        answer = text.strip()
-        self.store.resolve_clarification(cl.id, answer)
-
-        # Best-effort apply the answer to the linked line item, if any.
-        if cl.line_item_id is not None:
-            li = self.store.get_line_item(cl.line_item_id)
-            if li is not None:
-                categories = self.store.list_categories()
-                cat_by_name = {c.name.lower(): c for c in categories}
-                self._apply_text_patch_to_line_item(li, answer, cat_by_name)
-                # Also clear needs_review now that the clarification is resolved.
-                self.store.update_line_item(li.id, needs_review=False)
-
-        # If no more open clarifications for this receipt -> flip to confirmed.
-        receipt_id = cl.receipt_id
-        receipt = self.store.get_receipt(receipt_id)
-        items = self.store.list_line_items(receipt_id) if receipt else []
-        any_needs_review = any(li.needs_review for li in items)
-        if not any_needs_review and receipt is not None:
-            self.store.update_receipt_status(receipt_id, ReceiptStatus.CONFIRMED)
-            self.whatsapp.send_text(from_phone, "Got it, thanks! The receipt is now confirmed ✅")
-            return "resolved and receipt confirmed"
-        self.whatsapp.send_text(from_phone, "Got it, thanks!")
-        return "resolved"
-
-    def _apply_freeform_correction(self, member, text: str, from_phone: str) -> str:
-        # No digit at all -> this isn't an attempted correction (e.g. "hey", "thanks"),
-        # so don't imply we tried and failed to parse one.
-        if not re.search(r"\d", text):
-            reply = "Hey! Send a photo of a receipt to log a purchase, or reply to a recent one with a correction like 'item 2 price was 2500'."
-            self.whatsapp.send_text(from_phone, reply)
-            return reply
-
-        # Find latest receipt (any status).
-        recent = self.store.list_receipts(family_id=member.family_id)
-        my_recent = [r for r in recent if r.member_id == member.id]
-        if not my_recent:
-            reply = "Nothing to correct yet — send a receipt photo first 🙂."
-            self.whatsapp.send_text(from_phone, reply)
-            return reply
-        receipt = my_recent[0]
-        items = self.store.list_line_items(receipt.id)
-        categories = self.store.list_categories()
-        cat_by_name = {c.name.lower(): c for c in categories}
-
-        patched_any = False
-        for m in re.finditer(r"(?:item\s*)?(\d+)\b", text, re.IGNORECASE):
-            try:
-                idx1 = int(m.group(1))
-            except ValueError:
-                continue
-            if 1 <= idx1 <= len(items):
-                li = items[idx1 - 1]
-                self._apply_text_patch_to_line_item(li, text, cat_by_name)
-                patched_any = True
-
-        if patched_any:
-            # Re-check if all line items are now clean -> promote to confirmed
-            fresh = self.store.list_line_items(receipt.id)
-            if not any(li.needs_review for li in fresh):
-                self.store.update_receipt_status(receipt.id, ReceiptStatus.CONFIRMED)
-            reply = "Correction applied ✅"
-            self.whatsapp.send_text(from_phone, reply)
-            return reply
-
-        reply = (
-            "I didn't spot a correction pattern I understand. Try: 'item 2 price was 2500', "
-            "'item 3 was Groceries', or 'item 1 name was Indomie & price 1500'."
-        )
-        self.whatsapp.send_text(from_phone, reply)
-        return reply
-
-    def _apply_text_patch_to_line_item(self, li: LineItem, text: str, cat_by_name: dict[str, Category]) -> None:
-        """Parse a freeform correction and patch price/category/name on a line item.
-        Intentionally simple regex-based heuristic, not an LLM call — corrections are cheap and short.
-
-        Patterns supported:
-          - "price was X" / "price X" / "was X" (X digits) -> price
-          - "category was X" / X ∈ Groceries/Transport/... (case-insensitive)
-          - "name was X" or any long string afterwards -> name
-        """
-        t = text.lower()
-        # Price: any digit sequence with optional decimals after a price/was/for.
-        price_match = re.search(r"(?:price|was|for)\s*[₦n]?\s*([0-9][0-9,]*(?:\.\d+)?)", t)
-        if not price_match:
-            # Bare number near a price-ish indicator: second try: any number after 'item N '
-            after_idx = re.search(r"item\s+\d+\s+(?:.*?)([0-9][0-9,]*(?:\.\d+)?)$", t)
-            if after_idx:
-                price_match = after_idx
-        if price_match:
-            raw = price_match.group(1).replace(",", "")
-            try:
-                new_price = Decimal(raw)
-                self.store.update_line_item(li.id, price=new_price.quantize(Decimal("0.01")))
-            except Exception:
-                pass
-
-        # Category: any exact category name in text.
-        for name_lc, cat in cat_by_name.items():
-            if re.search(rf"\b{re.escape(name_lc)}\b", t):
-                self.store.update_line_item(li.id, category_id=cat.id)
-                break
-
-        # Name: "name was <something>" up to end or next dot/period delimiter.
-        name_m = re.search(r"name\s+was\s+(.+?)(?:\.|$)", text, re.IGNORECASE)
-        if name_m:
-            new_name = name_m.group(1).strip()
-            if new_name:
-                self.store.update_line_item(li.id, name=new_name)
+        # 2. Everything else: the agent decides the intent from the message plus
+        # memory and live data, validates it, then acts (app/services/agent.py).
+        return self.agent.handle(member, text)
 
 
 def process_inbound_message(
@@ -408,8 +237,19 @@ def process_inbound_message(
     """Route one normalized inbound message through onboarding → image/text handling.
 
     Shared by the real webhook route and the local `/test/message` route so both
-    exercise the exact same dispatch logic.
+    exercise the exact same dispatch logic. Each call is one Langfuse trace.
     """
+    kind = ("pdf" if msg.media_mime == "application/pdf" else "image") if (msg.image_id or msg.image_bytes is not None) \
+        else ("text" if msg.text is not None else "other")
+    with observability.trace_message(
+        msg.from_phone, kind, input=msg.text if kind == "text" else f"[{kind} message]"
+    ) as trace:
+        result = _dispatch(pipe, msg, whatsapp)
+        trace.update(output=result)
+        return result
+
+
+def _dispatch(pipe: CapturePipeline, msg: WhatsAppInboundMessage, whatsapp: WhatsAppClient) -> str:
     member_exists, question = pipe.handle_known_sender(msg.from_phone)
     if not member_exists:
         if is_pending_onboard(msg.from_phone) and msg.text is not None:
@@ -424,14 +264,20 @@ def process_inbound_message(
         try:
             msg.image_bytes = whatsapp.download_image(msg.image_id)
         except Exception as e:
-            logger.warning("Couldn't download WhatsApp image %s: %s", msg.image_id, e)
-            whatsapp.send_text(msg.from_phone, "I couldn't load that image — could you try sending it again?")
+            logger.warning("Couldn't download WhatsApp media %s: %s", msg.image_id, e)
+            what = "file" if msg.media_mime == "application/pdf" else "image"
+            whatsapp.send_text(msg.from_phone, f"I couldn't load that {what}. Could you try sending it again?")
             return "image-download-failed"
 
     if msg.image_bytes is not None:
-        return pipe.process_image(msg.from_phone, msg.image_bytes, msg.image_id or "")
+        return pipe.process_image(msg.from_phone, msg.image_bytes, msg.image_id or "", msg.media_mime)
     elif msg.text is not None:
         return pipe.handle_text(msg.from_phone, msg.text)
     else:
-        whatsapp.send_text(msg.from_phone, "I only understand photos of receipts or correction messages right now 🙂")
+        if msg.unsupported_document:
+            reply = (f"I can't open {msg.unsupported_document}. Send the receipt as a photo or a PDF, "
+                     "or type what you bought.")
+        else:
+            reply = "I can read receipt photos, PDF receipts and text messages, but not that kind of message yet 🙂"
+        whatsapp.send_text(msg.from_phone, reply)
         return "ignored"

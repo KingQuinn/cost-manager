@@ -55,8 +55,22 @@ class Category(BaseModel):
     keywords: list[str] = []
 
 
+# Keywords match the START of a word in an item name ("cola" matches "AMERICAN
+# COLA" but not "CHOCOLATE"); the longest matching keyword wins (categorize.py).
+# Drinks (v1.8) = ready-to-drink beverages. Things you prepare a drink from
+# (milk, tea bags, coffee, Milo powder) stay in Groceries.
+DRINK_KEYWORDS = [
+    "drink", "juice", "cola", "coke", "fanta", "sprite", "pepsi", "7up", "mirinda",
+    "maltina", "malta", "schweppes", "chapman", "zobo", "kunu", "fura", "lucozade",
+    "aquafina", "h2o", "h20", "table water", "bottled water", "eva water", "pure life",
+    "ice tea", "iced tea", "5alive", "chivita", "capri", "smoothie", "milkshake", "yoghurt drink",
+    "beer", "lager", "stout", "guinness", "heineken", "trophy", "wine", "vodka", "whisky",
+    "red bull", "energy drink", "predator", "power horse", "bigi", "la casera", "soda", "tonic water",
+]
+
 DEFAULT_CATEGORIES: list[tuple[str, list[str]]] = [
     ("Groceries", ["rice","garri","beans","tomato","pepper","onion","yam","shoprite","market"]),
+    ("Drinks", DRINK_KEYWORDS),
     ("Transport", ["uber","bolt","keke","fuel","petrol","diesel","fare"]),
     ("Household", ["detergent","tissue","cleaning","bulb","omo","soap"]),
     ("Utilities", ["electricity","nepa","data","airtime","internet","dstv"]),
@@ -93,6 +107,10 @@ class LineItem(BaseModel):
     category_id: Optional[UUID] = None
     confidence: Optional[float] = None
     needs_review: bool = False
+    # 1-based position within the receipt — the chat UX's "item N" numbering
+    # refers to this, not insertion/row order (which SQL doesn't guarantee
+    # without an explicit ORDER BY).
+    position: int = 1
 
 
 class Clarification(BaseModel):
@@ -116,6 +134,29 @@ class WeeklySummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Conversation memory — architecture.md §7.7 (3 layers)
+# ---------------------------------------------------------------------------
+
+class ConversationTurn(BaseModel):
+    """Layer 2 (conversation state): one message in a member's chat with the bot."""
+    id: UUID = Field(default_factory=uuid4)
+    member_id: UUID
+    role: str  # "user" | "assistant"
+    content: str
+    intent: Optional[str] = None
+    created_at: datetime_cls = Field(default_factory=datetime_cls.utcnow)
+
+
+class MemberMemory(BaseModel):
+    """Layer 3 (long-term memory): a durable fact, preference or conversation summary."""
+    id: UUID = Field(default_factory=uuid4)
+    member_id: UUID
+    kind: str = "fact"  # "fact" | "summary"
+    content: str
+    created_at: datetime_cls = Field(default_factory=datetime_cls.utcnow)
+
+
+# ---------------------------------------------------------------------------
 # Message / webhook DTOs
 # ---------------------------------------------------------------------------
 
@@ -124,8 +165,10 @@ class WhatsAppInboundMessage(BaseModel):
     from_phone: str
     message_id: str
     text: Optional[str] = None
-    image_id: Optional[str] = None
+    image_id: Optional[str] = None      # WhatsApp media id: a photo, or a PDF/image sent as a document
     image_bytes: Optional[bytes] = None
+    media_mime: Optional[str] = None    # e.g. "application/pdf"; None = sniff from the bytes
+    unsupported_document: Optional[str] = None  # filename of a document we can't read (e.g. .docx)
     timestamp: datetime_cls = Field(default_factory=datetime_cls.utcnow)
 
 
