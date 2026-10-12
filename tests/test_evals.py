@@ -86,11 +86,14 @@ def test_checker_passes_a_router_that_returns_exactly_the_expected_decision(case
 
     e = case["expect"]
     raw = {"intent": e.get("intent", "smalltalk"), "confidence": 0.95, "item_number": e.get("item_number"),
+           "item_name": e.get("item_name_contains"),
            "verdict": e.get("verdict"), "remember": ["x"] if e.get("remembers") else []}
     if "price" in e or (e.get("category") and e.get("intent") != "spending_question"):
         raw["patch"] = {"price": e.get("price"), "category": e.get("category")}
     if e.get("intent") == "spending_question":
         raw["query"] = {k: e[k] for k in ("scope", "period", "category") if k in e}
+        if "item_terms_include" in e:
+            raw["query"]["item_terms"] = [e["item_terms_include"]]
     if "purchase_total" in e:
         raw["purchase"] = {"items": [{"name": "x", "total_price": e["purchase_total"]}]}
     assert check(e, decision_summary(RouterDecision.model_validate(raw))) == []

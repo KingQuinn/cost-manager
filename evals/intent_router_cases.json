@@ -1,47 +1,226 @@
 {
-  "description": "Golden set for the intent router (app/services/agent.py). Each case is one WhatsApp text and what the router must decide. 'household' is 'confirmed' (one Shoprite receipt: 1 Rice 10kg 30000, 2 Peak milk 1500) or 'open' (that plus a Spar receipt whose items 2 and 5 have open clarifications). 'expect' fields are checked only when present. Cases tagged bug1/bug2/bug3 are the three silent-data-change bugs (architecture.md changelog v1.5). Run live with validate_intents.py; offline regressions in tests/test_evals.py.",
-  "cases": [
-    {"id": "bug1-eggs-in-words", "tags": ["bug1"], "household": "confirmed",
-     "message": "bought 2 crates of eggs for 4500",
-     "expect": {"intent": "log_purchase", "purchase_total": 4500}},
-    {"id": "bug1-eggs-after-unreadable-photo", "tags": ["bug1"], "household": "confirmed", "awaiting_description": true,
-     "message": "bought 2 crates of eggs for 4500",
-     "expect": {"intent": "log_purchase", "purchase_total": 4500}},
-    {"id": "bug1-keke-fare", "tags": ["bug1"], "household": "confirmed",
-     "message": "paid 1500 for keke to the market",
-     "expect": {"intent": "log_purchase", "purchase_total": 1500}},
-    {"id": "bug2-question-while-open", "tags": ["bug2"], "household": "open",
-     "message": "how much have we spent on groceries?",
-     "expect": {"intent": "spending_question", "scope": "family", "category": "Groceries"}},
-    {"id": "bug2-last-week-while-open", "tags": ["bug2"], "household": "open",
-     "message": "what did I spend last week",
-     "expect": {"intent": "spending_question", "scope": "me", "period": "last_week"}},
-    {"id": "bug3-names-item-5", "tags": ["bug3"], "household": "open",
-     "message": "item 5 price was 1800",
-     "expect": {"intent": "answer_clarification", "item_number": 5, "price": 1800}},
-    {"id": "bug3-ok-2", "tags": ["bug3"], "household": "open",
-     "message": "ok 2",
-     "expect": {"intent": "answer_clarification", "item_number": 2, "verdict": "correct"}},
-    {"id": "bug3-unnumbered-with-two-open", "tags": ["bug3"], "household": "open",
-     "message": "the price was 1800",
-     "expect": {"intent": "answer_clarification", "item_number": null}},
-    {"id": "correct-category", "tags": ["everyday"], "household": "confirmed",
-     "message": "item 1 was Dining",
-     "expect": {"intent": "correct_item", "item_number": 1, "category": "Dining"}},
-    {"id": "correct-by-name", "tags": ["everyday"], "household": "confirmed",
-     "message": "the rice should be 32000",
-     "expect": {"intent": "correct_item", "item_number": 1, "price": 32000}},
-    {"id": "show-last", "tags": ["everyday"], "household": "confirmed",
-     "message": "show me my last receipt",
-     "expect": {"intent": "show_last_receipt"}},
-    {"id": "help", "tags": ["everyday"], "household": "confirmed",
-     "message": "what can you do?",
-     "expect": {"intent": "help"}},
-    {"id": "thanks", "tags": ["everyday"], "household": "confirmed",
-     "message": "thank you!",
-     "expect": {"intent": "smalltalk"}},
-    {"id": "remember-budget", "tags": ["memory"], "household": "confirmed",
-     "message": "our grocery budget is 60k a week",
-     "expect": {"remembers": true}}
-  ]
+ "description": "Golden set for the intent router (app/services/agent.py). Each case is one WhatsApp text and what the router must decide. 'household' is 'confirmed' (one Shoprite receipt: 1 Rice 10kg 30000, 2 Peak milk 1500) or 'open' (that plus a Spar receipt whose items 2 and 5 have open clarifications). 'expect' fields are checked only when present. '_contains' / '_include' keys check a substring of a string / an entry in a list. Cases tagged bug1/bug2/bug3 are the three silent-data-change bugs (architecture.md changelog v1.5). Run live with validate_intents.py; offline regressions in tests/test_evals.py.",
+ "cases": [
+  {
+   "id": "bug1-eggs-in-words",
+   "tags": [
+    "bug1"
+   ],
+   "household": "confirmed",
+   "message": "bought 2 crates of eggs for 4500",
+   "expect": {
+    "intent": "log_purchase",
+    "purchase_total": 4500
+   }
+  },
+  {
+   "id": "bug1-eggs-after-unreadable-photo",
+   "tags": [
+    "bug1"
+   ],
+   "household": "confirmed",
+   "awaiting_description": true,
+   "message": "bought 2 crates of eggs for 4500",
+   "expect": {
+    "intent": "log_purchase",
+    "purchase_total": 4500
+   }
+  },
+  {
+   "id": "bug1-keke-fare",
+   "tags": [
+    "bug1"
+   ],
+   "household": "confirmed",
+   "message": "paid 1500 for keke to the market",
+   "expect": {
+    "intent": "log_purchase",
+    "purchase_total": 1500
+   }
+  },
+  {
+   "id": "bug2-question-while-open",
+   "tags": [
+    "bug2"
+   ],
+   "household": "open",
+   "message": "how much have we spent on groceries?",
+   "expect": {
+    "intent": "spending_question",
+    "scope": "family",
+    "category": "Groceries"
+   }
+  },
+  {
+   "id": "bug2-last-week-while-open",
+   "tags": [
+    "bug2"
+   ],
+   "household": "open",
+   "message": "what did I spend last week",
+   "expect": {
+    "intent": "spending_question",
+    "scope": "me",
+    "period": "last_week"
+   }
+  },
+  {
+   "id": "bug3-names-item-5",
+   "tags": [
+    "bug3"
+   ],
+   "household": "open",
+   "message": "item 5 price was 1800",
+   "expect": {
+    "intent": "answer_clarification",
+    "item_number": 5,
+    "price": 1800
+   }
+  },
+  {
+   "id": "bug3-ok-2",
+   "tags": [
+    "bug3"
+   ],
+   "household": "open",
+   "message": "ok 2",
+   "expect": {
+    "intent": "answer_clarification",
+    "item_number": 2,
+    "verdict": "correct"
+   }
+  },
+  {
+   "id": "bug3-unnumbered-with-two-open",
+   "tags": [
+    "bug3"
+   ],
+   "household": "open",
+   "message": "the price was 1800",
+   "expect": {
+    "intent": "answer_clarification",
+    "item_number": null
+   }
+  },
+  {
+   "id": "correct-category",
+   "tags": [
+    "everyday"
+   ],
+   "household": "confirmed",
+   "message": "item 1 was Dining",
+   "expect": {
+    "intent": "correct_item",
+    "item_number": 1,
+    "category": "Dining"
+   }
+  },
+  {
+   "id": "correct-by-name",
+   "tags": [
+    "everyday"
+   ],
+   "household": "confirmed",
+   "message": "the rice should be 32000",
+   "expect": {
+    "intent": "correct_item",
+    "item_number": 1,
+    "price": 32000
+   }
+  },
+  {
+   "id": "show-last",
+   "tags": [
+    "everyday"
+   ],
+   "household": "confirmed",
+   "message": "show me my last receipt",
+   "expect": {
+    "intent": "show_last_receipt"
+   }
+  },
+  {
+   "id": "help",
+   "tags": [
+    "everyday"
+   ],
+   "household": "confirmed",
+   "message": "what can you do?",
+   "expect": {
+    "intent": "help"
+   }
+  },
+  {
+   "id": "thanks",
+   "tags": [
+    "everyday"
+   ],
+   "household": "confirmed",
+   "message": "thank you!",
+   "expect": {
+    "intent": "smalltalk"
+   }
+  },
+  {
+   "id": "remember-budget",
+   "tags": [
+    "memory"
+   ],
+   "household": "confirmed",
+   "message": "our grocery budget is 60k a week",
+   "expect": {
+    "remembers": true
+   }
+  },
+  {
+   "id": "v17-i-have-a-receipt",
+   "tags": [
+    "v1.7"
+   ],
+   "household": "confirmed",
+   "message": "i have a receipt",
+   "expect": {
+    "intent": "expect_receipt"
+   }
+  },
+  {
+   "id": "v17-category-by-name-older-receipt",
+   "tags": [
+    "v1.7"
+   ],
+   "household": "confirmed",
+   "message": "Change category of Schweppes chapman to groceries",
+   "expect": {
+    "intent": "correct_item",
+    "item_name_contains": "schweppes",
+    "category": "Groceries"
+   }
+  },
+  {
+   "id": "v17-move-item-between-categories",
+   "tags": [
+    "v1.7"
+   ],
+   "household": "confirmed",
+   "message": "Move Schweppes chapman from personal to groceries",
+   "expect": {
+    "intent": "correct_item",
+    "item_name_contains": "schweppes",
+    "category": "Groceries"
+   }
+  },
+  {
+   "id": "v17-doughnuts-last-week",
+   "tags": [
+    "v1.7"
+   ],
+   "household": "confirmed",
+   "message": "How much did I spend on donuts last week?",
+   "expect": {
+    "intent": "spending_question",
+    "period": "last_week",
+    "item_terms_include": "doughnut"
+   }
+  }
+ ]
 }

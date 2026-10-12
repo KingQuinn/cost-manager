@@ -5,6 +5,7 @@ Gemini is never called: `llm.generate` / `llm.generate_json` are replaced with a
 scripted fake, so each test states exactly what the router "decided" and then
 checks that the data only changed in the way the decision allows.
 """
+import re
 from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
@@ -56,6 +57,9 @@ class FakeLLM:
 
         def generate_json(name, parts, **kw):
             self._log(name)
+            if name == "categorize-items":
+                names = re.findall(r'^- "(.*)"$', parts[0], re.M)
+                return {n: self.category for n in names}
             r = self.routers.pop(0) if self.routers else self.router
             if isinstance(r, Exception):
                 raise r
@@ -405,7 +409,8 @@ def test_cache_returns_copies(env):
 def test_cache_does_not_hold_state_or_receipts(env):
     """Receipts, clarifications, turns and state slots are always read fresh."""
     from app.db.instrumented import CACHED
-    assert set(CACHED) == {"get_member_by_phone", "list_members", "list_categories", "list_member_memories"}
+    assert set(CACHED) == {"get_or_create_default_family", "get_member_by_phone", "list_members",
+                           "list_categories", "list_member_memories"}
 
 
 def test_longterm_memory_visible_right_after_it_is_written(env):
@@ -613,7 +618,7 @@ def test_breakdown_filters_and_excludes_needs_review(env):
 
     mine = env.store.spending_breakdown(fam.id, member_id=env.member.id, category_id=env.cats["Groceries"].id)
     assert mine["total"] == Decimal("30000")
-    eggs = env.store.spending_breakdown(fam.id, item_query="EGGS")
+    eggs = env.store.spending_breakdown(fam.id, item_terms=["EGGS"])
     assert eggs["total"] == Decimal("3000")  # the needs_review eggs aren't counted
 
 
@@ -638,8 +643,126 @@ def test_supabase_breakdown_calls_sql_function_and_parses_numbers():
     store = SupabaseStore.__new__(SupabaseStore)
     store._client = type("C", (), {"rpc": lambda self, name, params: RPC(sink, name, params)})()
     fam = uuid4()
-    out = store.spending_breakdown(fam, start=date(2026, 10, 1), item_query="rice")
+    out = store.spending_breakdown(fam, start=date(2026, 10, 1), item_terms=["Rice 10kg", "rice"])
     assert sink == [("spending_breakdown", {
         "p_family_id": str(fam), "p_member_id": None, "p_start": "2026-10-01", "p_end": None,
-        "p_category_id": None, "p_item": "rice"})]
+        "p_category_id": None, "p_items": ["rice10kg", "rice"]})]
     assert out["total"] == Decimal("31500.50") and out["top_items"][0]["amount"] == Decimal("30000.00")
+
+
+# ---------------------------------------------------------------------------
+# v1.7 — feedback from live testing
+# ---------------------------------------------------------------------------
+
+def add_dated_receipt(e, vendor, items, when, created_days_ago=30):
+    """A confirmed receipt with a real purchase date, logged in the past (every item at position 1,
+    like receipts saved before migration 0001)."""
+    from datetime import datetime, timedelta
+    r = e.store.create_receipt(Receipt(member_id=e.member.id, vendor=vendor, status=ReceiptStatus.CONFIRMED,
+                                       purchase_date=when,
+                                       created_at=datetime.utcnow() - timedelta(days=created_days_ago)))
+    lis = [LineItem(receipt_id=r.id, name=n, price=Decimal(p), category_id=e.cats[c].id, position=1)
+           for n, p, c in items]
+    e.store.create_line_items(lis)
+    return r, lis
+
+
+def test_category_edit_by_name_reaches_older_receipts(env):
+    """Live bug: 'Move Schweppes chapman from personal to groceries' always got 'Which item should I change?'
+    because it was on an older receipt, not the last one."""
+    old = date(2026, 8, 16)
+    _, a = add_dated_receipt(env, "PRINCEEBEANO", [("SCHWEPPES CHAPMAN", 12338.40, "Personal")], old, 25)
+    _, b = add_dated_receipt(env, "PRINCEEBEANO", [("SCHWEPPES CHAPMAN", 12338.40, "Personal")], old, 24)
+    env.store.append_category_keywords(env.cats["Personal"].id, ["schweppes", "chapman"])
+    _, last = add_receipt(env, "COLD STONE", [("Wallet Transfer", 14800, "Personal")])
+    # The router even guesses item 1 — but item 1 on the last receipt is the Wallet Transfer.
+    env.llm.router = {"intent": "correct_item", "confidence": 0.95, "item_number": 1,
+                      "item_name": "Schweppes chapman", "patch": {"category": "Groceries"}}
+    reply = say(env, "Move Schweppes chapman from personal to groceries")
+    assert reply.startswith("Moved SCHWEPPES CHAPMAN from Personal to Groceries on 2 receipt lines")
+    assert item(env, a[0]).category_id == item(env, b[0]).category_id == env.cats["Groceries"].id
+    assert item(env, last[0]).category_id == env.cats["Personal"].id  # untouched
+    cats = {c.name: c for c in env.store.list_categories()}
+    assert "schweppes" in cats["Groceries"].keywords and "schweppes" not in cats["Personal"].keywords
+
+
+def test_price_edit_by_name_with_several_lines_asks_which(env):
+    old = date(2026, 8, 16)
+    _, lis = add_dated_receipt(env, "PRINCEEBEANO", [("DE PRINCE DOUGHNUT", 650, "Groceries"),
+                                                     ("DE PRINCE DOUGHNUT", 550, "Groceries")], old)
+    env.llm.router = {"intent": "correct_item", "confidence": 0.95, "item_name": "doughnut", "patch": {"price": 600}}
+    reply = say(env, "the doughnut was 600")
+    assert "is on 2 receipt lines" in reply and "Which one should change?" in reply
+    assert [item(env, li).price for li in lis] == [Decimal("650"), Decimal("550")]
+
+
+def test_edit_by_name_not_found_changes_nothing(env):
+    add_receipt(env, "Shoprite", [("Rice", 30000, "Groceries")])
+    env.llm.router = {"intent": "correct_item", "confidence": 0.95, "item_name": "chapman", "patch": {"category": "Dining"}}
+    assert "couldn't find an item called 'chapman'" in say(env, "chapman is dining")
+
+
+def test_i_have_a_receipt_asks_for_the_photo(env):
+    env.llm.router = {"intent": "expect_receipt", "confidence": 0.95}
+    reply = say(env, "i have a receipt")
+    assert reply.startswith("Great, send me a photo of the receipt")
+    assert env.store.list_receipts(family_id=env.member.family_id) == []
+    env.llm.router = RuntimeError("Gemini down")  # the offline parser knows it too
+    assert say(env, "I have a receipt").startswith("Great, send me a photo")
+
+
+def test_item_question_matches_spellings_and_says_when_last_bought(env):
+    """Live bug: 'doughnuts last week' found nothing — the receipt says 'DE PRINCE DOUGH NUT' and was from August."""
+    add_dated_receipt(env, "PRINCEEBEANO", [("DE PRINCE DOUGH NUT", 650, "Groceries"),
+                                            ("DE PRINCE DOUGHNUT", 550, "Groceries"),
+                                            ("MENTOS", 1990, "Groceries")], date(2026, 8, 16))
+    env.llm.router = {"intent": "spending_question", "confidence": 0.95,
+                      "query": {"scope": "me", "period": "last_week", "item": "doughnuts",
+                                "item_terms": ["doughnut", "donut", "dough nut"]}}
+    env.llm.answer = RuntimeError("phrasing down")  # templated answer shows the data itself
+    reply = say(env, "How much did I spend on doughnuts last week?")
+    assert "No confirmed receipts match that yet." in reply
+    assert "Last bought on 2026-08-16 (₦1,200 all time)." in reply
+
+    env.llm.router["query"]["period"] = "all_time"
+    assert "Total: ₦1,200 across 1 receipt(s)" in say(env, "how much on doughnuts ever?")
+
+
+def test_item_search_terms_add_singular():
+    from app.services.spending import item_search_terms
+    assert item_search_terms("doughnuts", ["donut"]) == ["doughnuts", "doughnut", "donut"]
+    assert item_search_terms("berries") == ["berries", "berry"]
+    assert item_search_terms("glass") == ["glass"]
+
+
+def test_receipt_confirmation_shows_purchase_date(env):
+    r, lis = add_dated_receipt(env, "COLD STONE", [("Ice cream", 14800, "Dining")], date(2026, 9, 17))
+    env.llm.router = {"intent": "show_last_receipt", "confidence": 0.95}
+    assert "from COLD STONE, dated 17 Sep 2026." in say(env, "show my last receipt")
+
+
+def test_receipt_items_the_rules_miss_go_to_gemini_in_one_call(env, monkeypatch):
+    """Live trace: a 35-item receipt made 14 categorize calls one after another (~18s,
+    and over the free tier's 15 requests/minute). Now it's one call."""
+    from app.models import ExtractedLineItem, ExtractionResult
+
+    names = ["QWALPHA", "QWBETA", "QWGAMMA", "Rice 5kg"]  # Rice is caught by the keyword rules
+    monkeypatch.setattr(capture_pipeline, "extract_receipt", lambda b: ExtractionResult(
+        vendor="Spar", date=date(2026, 10, 1), total=Decimal("400"), overall_confidence=0.95,
+        line_items=[ExtractedLineItem(name=n, quantity=1, total_price=Decimal("100"), confidence=0.95)
+                    for n in names]))
+    env.llm.category = "Household"
+    reply = env.pipe.process_image(PHONE, b"img", "img-1")
+    assert env.llm.calls.count("categorize-items") == 1 and "categorize-item" not in env.llm.calls
+    assert "QWALPHA · ₦100 · Household" in reply and "Rice 5kg · ₦100 · Groceries" in reply
+
+
+def test_categorization_failure_files_items_under_other(env, monkeypatch):
+    from app.models import ExtractedLineItem, ExtractionResult
+
+    monkeypatch.setattr(capture_pipeline, "extract_receipt", lambda b: ExtractionResult(
+        vendor="Spar", total=Decimal("100"), overall_confidence=0.95,
+        line_items=[ExtractedLineItem(name="QWDELTA", quantity=1, total_price=Decimal("100"), confidence=0.95)]))
+    monkeypatch.setattr(capture_pipeline, "categorize_many_with_llm",
+                        lambda names: (_ for _ in ()).throw(RuntimeError("429 quota")))
+    assert "QWDELTA · ₦100 · Other" in env.pipe.process_image(PHONE, b"img", "img-2")

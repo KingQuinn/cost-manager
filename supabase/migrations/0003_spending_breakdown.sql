@@ -20,7 +20,7 @@ stable
 as $$
   with dated as (
     select r.id, r.member_id, r.vendor, r.status, r.total,
-           coalesce(r.purchase_date, (r.created_at at time zone 'utc')::date) as spend_date
+          coalesce(r.purchase_date, (r.created_at at time zone 'utc')::date) as spend_date
     from receipts r
     join members m on m.id = r.member_id
     where m.family_id = p_family_id

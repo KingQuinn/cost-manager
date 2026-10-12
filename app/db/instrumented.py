@@ -27,6 +27,7 @@ CACHE_TTL_SECONDS = 300
 
 # method -> cache key prefix. The key is (prefix, *args).
 CACHED = {
+    "get_or_create_default_family": "family",
     "get_member_by_phone": "member_by_phone",
     "list_members": "members",
     "list_categories": "categories",
@@ -36,6 +37,7 @@ CACHED = {
 INVALIDATES = {
     "create_member": ("member_by_phone", "members"),
     "append_category_keywords": ("categories",),
+    "remove_category_keywords": ("categories",),
     "add_member_memory": ("memories",),
     "delete_member_memory": ("memories",),
 }

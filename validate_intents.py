@@ -27,9 +27,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATASET = "intent-router-golden"
+# Gemini's free tier allows 15 requests a minute; going faster makes calls fail
+# and the case silently falls back to the offline parser. One call per case.
+PACE_SECONDS = 4.5
 
 
 def route(case: dict) -> dict:
+    import time
+    time.sleep(PACE_SECONDS)
     from app.services.agent import ConversationAgent
     from evals.intent_cases import build_household, decision_summary
 
@@ -102,7 +107,7 @@ def run_langfuse(cases: list[dict]) -> int:
 
     result = lf.get_dataset(DATASET).run_experiment(
         name="intent-router", description=f"model={get_settings().gemini_chat_model}",
-        task=task, evaluators=[intent_correct, all_fields_correct], max_concurrency=4,
+        task=task, evaluators=[intent_correct, all_fields_correct], max_concurrency=1,
         metadata={"model": get_settings().gemini_chat_model},
     )
     lf.flush()

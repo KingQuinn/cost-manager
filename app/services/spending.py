@@ -78,6 +78,7 @@ def spending_snapshot(
     end: Optional[str] = None,
     category: Optional[str] = None,
     item_query: Optional[str] = None,
+    item_terms: Optional[list[str]] = None,
     today: Optional[date] = None,
 ) -> dict:
     """Answer data for a spending question. Totals come from the database
@@ -95,13 +96,11 @@ def spending_snapshot(
         if cat_filter is None and not item_query:
             item_query = category  # "how much on eggs" — not a category, so match item names
 
+    terms = item_search_terms(item_query, item_terms)
+    member_id = None if family_scope else member.id
     b = store.spending_breakdown(
-        member.family_id,
-        member_id=None if family_scope else member.id,
-        start=d_start,
-        end=d_end,
-        category_id=cat_filter.id if cat_filter else None,
-        item_query=(item_query or "").strip() or None,
+        member.family_id, member_id=member_id, start=d_start, end=d_end,
+        category_id=cat_filter.id if cat_filter else None, item_terms=terms or None,
     )
     total = b["total"]
 
@@ -115,9 +114,10 @@ def spending_snapshot(
             "start": d_start.isoformat() if d_start else None,
             "end": d_end.isoformat() if d_end else None,
         },
-        "filter": cat_filter.name if cat_filter else (item_query or None),
+        "filter": cat_filter.name if cat_filter else (item_query or (terms[0] if terms else None)),
         "confirmed_receipts": b["confirmed_receipts"],
         "total": format_ngn(total),
+        "purchase_dates": {"first": b["first_date"], "last": b["last_date"]},
         "by_category": [
             {"category": r["name"], "amount": format_ngn(r["amount"]), "share": share(r["amount"])}
             for r in b["by_category"]
@@ -132,12 +132,42 @@ def spending_snapshot(
             "amount": format_ngn(b["pending_amount"]),
         },
     }
+    if terms and not b["confirmed_receipts"] and (d_start or d_end):
+        # "Doughnuts last week?" -> none. Say when they were last bought instead of a bare zero.
+        ever = store.spending_breakdown(member.family_id, member_id=member_id,
+                                        category_id=cat_filter.id if cat_filter else None, item_terms=terms)
+        data["outside_this_period"] = {
+            "total_all_time": format_ngn(ever["total"]),
+            "receipts_all_time": ever["confirmed_receipts"],
+            "last_bought": ever["last_date"],
+        }
     if family_scope:
         data["by_member"] = [
             {"member": r["name"], "amount": format_ngn(r["amount"]), "share": share(r["amount"])}
             for r in b["by_member"]
         ]
     return data
+
+
+def item_search_terms(item_query: Optional[str], item_terms: Optional[list[str]] = None) -> list[str]:
+    """Spellings to search item names for. Adds a singular form ("doughnuts" ->
+    "doughnut") so a plural question still matches a singular receipt line."""
+    out: list[str] = []
+    for raw in [item_query, *(item_terms or [])]:
+        t = (raw or "").strip().lower()
+        if not t:
+            continue
+        forms = [t]
+        if t.endswith("ies") and len(t) > 4:
+            forms.append(t[:-3] + "y")
+        elif t.endswith("es") and len(t) > 4 and t[-3] in "sxz":
+            forms.append(t[:-2])
+        elif t.endswith("s") and not t.endswith("ss") and len(t) > 3:
+            forms.append(t[:-1])
+        for f in forms:
+            if f not in out:
+                out.append(f)
+    return out
 
 
 def norm_amount(d: Decimal) -> str:
@@ -181,6 +211,9 @@ def format_snapshot(data: dict) -> str:
             lines.append("By member:")
             for m in data["by_member"]:
                 lines.append(f"  {m['member']}: {m['amount']}")
+    if data.get("outside_this_period", {}).get("last_bought"):
+        o = data["outside_this_period"]
+        lines.append(f"Last bought on {o['last_bought']} ({o['total_all_time']} all time).")
     pend = data["excluded_pending_review"]
     if pend["receipts"]:
         lines.append("")

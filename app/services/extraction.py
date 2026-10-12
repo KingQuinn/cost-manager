@@ -57,6 +57,18 @@ Line item name: "{item_name}"
 """
 
 
+_BATCH_CATEGORY_PROMPT_TEMPLATE = """\
+You are a categorizer for a family expense tracker in Nigeria. Assign each \
+purchase line item below to exactly one category from this list: \
+{category_list}. Receipt names are often abbreviated or misspelled.
+
+Return ONLY a JSON object mapping each item name, copied exactly, to its category name.
+
+Line items:
+{items}
+"""
+
+
 _PLACEHOLDER_PREFIXES = ("your_", "optional_test_", "pick_a_random")
 
 
@@ -260,3 +272,29 @@ def categorize_with_llm(item_name: str) -> str:
             return name
     logger.warning("LLM categorizer returned %r for %r; using Other", raw, item_name)
     return "Other"
+
+
+def categorize_many_with_llm(item_names: list[str]) -> dict[str, str]:
+    """One Gemini call for every item the keyword rules couldn't place.
+
+    A 35-item receipt used to make 14 separate calls (~18s, and more than the
+    free tier's 15 requests a minute). Returns {item_name: category}; any item
+    the model skips or labels with an unknown category becomes "Other".
+    """
+    names = list(dict.fromkeys(n for n in item_names if n))
+    if not names:
+        return {}
+    allowed = [name for name, _ in DEFAULT_CATEGORIES]
+    allowed_lc = {name.lower(): name for name in allowed}
+    prompt = _BATCH_CATEGORY_PROMPT_TEMPLATE.format(
+        category_list=", ".join(allowed),
+        items="\n".join(f"- {json.dumps(n, ensure_ascii=False)}" for n in names),
+    )
+    from app.services import llm
+
+    raw = llm.generate_json("categorize-items", [prompt], model_name="gemini-3.5-flash-lite", timeout=30)
+    by_lc = {str(k).strip().lower(): str(v).strip().lower() for k, v in raw.items()}
+    out = {}
+    for n in names:
+        out[n] = allowed_lc.get(by_lc.get(n.strip().lower(), ""), "Other")
+    return out

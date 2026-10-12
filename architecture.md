@@ -16,6 +16,7 @@
 | 1.4 | 2026-09-20 | Fixed FR-6 bug found in real Supabase testing: `line_items` had no explicit ordering column, so a correction like "item 19 is Household" could silently apply to a different row than the one shown in chat (Postgres doesn't guarantee row order without `ORDER BY`). Added `line_items.position` (1-based, set from extraction order) and order `list_line_items` by it. Migration in `supabase/migrations/0001_line_item_position.sql` for projects created before this fix. Also added three keyword-matched (no-LLM) chat intents — "help", show-last-receipt recap, and running spend-by-category — so plain-English asks outside the correction syntax get a real answer instead of the generic fallback. |
 | 1.5 | 2026-10-07 | Text messages now go through an LLM conversation agent (§7.7) instead of the regex correction parser, fixing three bugs that changed data silently: (1) "bought 2 crates of eggs for 4500" after an unreadable photo set item 2 of the last receipt to ₦4,500 — purchases described in words are now logged as new receipts (filling the empty one the unreadable photo created); (2) while a clarification was open, any message was saved as its answer and could re-categorize the item and confirm the receipt — questions are now answered and the clarification stays open, with a reminder; (3) with two open clarifications, a correction applied to whichever row the DB returned first — answers are now matched by item number, and an unnumbered answer asks which item. Gemini (`GEMINI_CHAT_MODEL`, default `gemini-3.5-flash-lite`) decides intent; code validates every change against the data, asks yes/no below `INTENT_MIN_CONFIDENCE` (0.7), and says exactly what changed. Spending questions are answered from computed numbers and rejected if they cite a ₦ amount not in the data. Added 3-layer memory (tables `conversation_turns`, `member_state`, `member_memories`; migration `0002_conversation_memory.sql`) and optional Langfuse tracing (§16). Strict offline fallback parser when Gemini is unavailable. New golden set for the router: `validate_intents.py`. |
 | 1.6 | 2026-10-07 | Memory re-layered as **cache → conversation state → long-term** (§7.7): new layer 1 is an in-process TTL cache (`app/services/cache.py`, 5 min) for member lookup, family members, categories and long-term memories, dropped immediately on writes through the store; recent turns moved into layer 2 alongside the state slots. Spending totals now come from a Postgres function `spending_breakdown` (migration `0003_spending_breakdown.sql`) instead of summing line items in Python, so the bot's numbers come only from SQL. Langfuse now also records a `route` span (the router's decision), an `act:<intent>` span (what code did) and a `db.<method>` span per database call with latency and cache hit/miss (`app/db/instrumented.py`). Router eval set moved to `evals/intent_router_cases.json` (shared by `validate_intents.py` and `tests/test_evals.py`); `validate_intents.py --langfuse` records a run against Langfuse dataset `intent-router-golden`. Live result on `gemini-3.5-flash-lite`: 14/14. |
+| 1.7 | 2026-10-12 | Fixes from the first live WhatsApp test (read from Langfuse traces). **Latency:** a text reply took 7–11s, about 60% of it ~13 sequential Supabase round trips (~0.35s each); the router's context reads now run in parallel, the last receipt is one `limit 1` query instead of a family-wide scan, open clarifications are one joined query, the open-item reminder reuses loaded data, and the family row is cached. A 35-item receipt made 14 sequential `categorize-item` calls (~18s, over the free tier's 15 requests/min); items the rules miss now go to Gemini in one `categorize-items` call. **Category edits:** "move Schweppes chapman to groceries" always asked "which item?" because only the last receipt was searchable by number; the router now returns `item_name` and code finds the item on any of the member's receipts (a category change applies to every line of that product; a price/name change must match exactly one line or the bot asks), and the item's words are removed from the wrong category's keywords so the rules stop repeating the mistake. **New intent `expect_receipt`:** "I have a receipt" asks for the photo instead of a typed description. **Item questions:** "doughnuts" didn't match "DE PRINCE DOUGH NUT"; the router now sends spellings in `item_terms` (plus an automatic singular), names are compared with spaces/punctuation removed, and when nothing matches the period the answer says when the item was last bought (migration `0004_spending_item_search.sql`, replaces the 0003 function). Confirmations show the receipt's purchase date. Eval set grown to 18 cases; live result 18/18, recorded in Langfuse. |
 
 *Add a row here every time a real decision changes — model swap, schema change, scope change. This document is only useful if it stays truthful.*
 
@@ -261,7 +262,7 @@ Text from a known member goes through `app/services/agent.py` in three steps:
    the member's memory and live data (open clarifications with their item
    numbers, the last receipt, what the bot is waiting on) and returns a JSON
    decision: intent (`answer_clarification`, `correct_item`, `log_purchase`,
-   `spending_question`, `show_last_receipt`, `help`, `confirm_pending`,
+   `spending_question`, `show_last_receipt`, `expect_receipt`, `help`, `confirm_pending`,
    `cancel_pending`, `smalltalk`, `unclear`), item number, patch, purchase or
    query spec. The LLM decides; it never writes.
 2. **Check** — code validates the decision before anything changes: the item
@@ -280,6 +281,13 @@ Text from a known member goes through `app/services/agent.py` in three steps:
    the same numbers is sent instead.
    While a clarification is open, any non-answer reply ends with a reminder
    of what's still waiting.
+
+Items can be corrected by number on the last receipt ("item 2 price was
+2500") or by name on any receipt ("move Schweppes chapman to Groceries"): the
+router returns `item_name` and code searches the member's receipts. A category
+change moves every line of that product and takes its words out of the old
+category's keywords; a price or name change must match exactly one line, or
+the bot lists the matches and asks.
 
 Purchases described in words become confirmed receipts (`raw_extraction`
 holds `{"source": "text", ...}`) and go through the normal rules-first
@@ -330,7 +338,9 @@ the source of truth for money and are queried fresh — never remembered.
   `supabase/migrations/0002_conversation_memory.sql`.
 - `spending_breakdown(...)` — SQL function returning totals by category,
   member, vendor and top items for a spending question (§7.7). Added in v1.6
-  via `supabase/migrations/0003_spending_breakdown.sql`.
+  via `supabase/migrations/0003_spending_breakdown.sql`; v1.7 replaced it with
+  a version that takes several item spellings and returns first/last purchase
+  dates (`0004_spending_item_search.sql`).
 
 ### 8.2 Schema
 
@@ -601,7 +611,7 @@ Minimum viable logging for a personal project:
   the fact without needing separate log infrastructure).
 - **Langfuse tracing** (optional, `app/observability.py`): one trace per
   inbound WhatsApp message, with a generation for every Gemini call inside it
-  (`extract-receipt`, `categorize-item`, `route-intent`,
+  (`extract-receipt`, `categorize-items`, `route-intent`,
   `answer-spending-question`, `summarize-conversation`) — input, output,
   latency, tokens. Grouped by member (`user_id` is a hash of the phone number,
   never the number) and by day (`session_id`). Receipt image bytes are never

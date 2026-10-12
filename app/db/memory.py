@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from app.db.base import DataStore, normalize_breakdown
+from app.db.base import DataStore, normalize_breakdown, squash
 from app.models import (
     Category,
     Clarification,
@@ -249,6 +249,33 @@ class InMemoryStore(DataStore):
         for mid in list(self._memories):
             self._memories[mid] = [m for m in self._memories[mid] if m.id != memory_id]
 
+    # ---------- lookups for the conversation agent ----------
+    def latest_receipt_for_member(self, member_id: UUID) -> Optional[Receipt]:
+        mine = [r for r in self._receipts.values() if r.member_id == member_id]
+        return max(mine, key=lambda r: r.created_at) if mine else None
+
+    def find_member_line_items(
+        self, member_id: UUID, words: list[str], limit: int = 50
+    ) -> list[tuple[LineItem, Receipt]]:
+        want = [w for w in (squash(x) for x in words) if w]
+        if not want:
+            return []
+        receipts = sorted((r for r in self._receipts.values() if r.member_id == member_id),
+                          key=lambda r: r.created_at, reverse=True)
+        out = []
+        for r in receipts:
+            for li in self.list_line_items(r.id):
+                if all(w in squash(li.name) for w in want):
+                    out.append((li, r))
+        return out[:limit]
+
+    def remove_category_keywords(self, category_id: UUID, keywords: list[str]) -> None:
+        cat = self._categories.get(category_id)
+        if cat is None:
+            return
+        drop = {k.lower() for k in keywords}
+        cat.keywords = [k for k in cat.keywords if k.lower() not in drop]
+
     # ---------- spending questions ----------
     def spending_breakdown(
         self,
@@ -258,12 +285,12 @@ class InMemoryStore(DataStore):
         start: Optional[date] = None,
         end: Optional[date] = None,
         category_id: Optional[UUID] = None,
-        item_query: Optional[str] = None,
+        item_terms: Optional[list[str]] = None,
     ) -> dict:
-        """Python mirror of the `spending_breakdown` SQL function (migrations/0003)."""
+        """Python mirror of the `spending_breakdown` SQL function (migrations/0004)."""
         members = {m.id: m for m in self.list_members(family_id)}
         cats = {c.id: c for c in self._categories.values()}
-        q = (item_query or "").lower() or None
+        terms = [t for t in (squash(x) for x in item_terms or []) if t]
         in_range = [
             r for r in self.list_receipts(family_id=family_id, start=start, end=end)
             if member_id is None or r.member_id == member_id
@@ -275,7 +302,7 @@ class InMemoryStore(DataStore):
             for li in self.list_line_items(r.id):
                 if category_id is not None and li.category_id != category_id:
                     continue
-                if q and q not in li.name.lower():
+                if terms and not any(t in squash(li.name) for t in terms):
                     continue
                 cat = cats.get(li.category_id)
                 who = members.get(r.member_id)
@@ -306,6 +333,8 @@ class InMemoryStore(DataStore):
                  "vendor": row["vendor"], "date": row["date"]}
                 for row in sorted(rows, key=lambda row: (-row["price"], row["item"]))[:5]
             ],
+            "first_date": min((row["date"] for row in rows), default=None),
+            "last_date": max((row["date"] for row in rows), default=None),
             "pending_receipts": len(pending),
             "pending_amount": sum((r.total or Decimal("0") for r in pending), Decimal("0")),
         })

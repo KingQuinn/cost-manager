@@ -29,9 +29,11 @@ This replaces the regex correction parser behind three silent-data-change bugs
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -51,8 +53,8 @@ from app.models import (
     ReceiptStatus,
 )
 from app.services import llm
-from app.services.categorize import categorize_item
-from app.services.extraction import categorize_with_llm
+from app.db.base import squash
+from app.services.categorize import _tokenize, categorize_by_rules, categorize_item
 from app.services.memory import ConversationMemory
 from app.services.spending import (
     amounts_in,
@@ -71,6 +73,7 @@ INTENTS = (
     "log_purchase",          # describing a NEW purchase in words
     "spending_question",     # asking about spend — answered from the database
     "show_last_receipt",
+    "expect_receipt",        # "I have a receipt" — ask for the photo
     "help",
     "confirm_pending",       # "yes" to a change we proposed
     "cancel_pending",        # "no" to a change we proposed
@@ -78,6 +81,12 @@ INTENTS = (
     "unclear",
 )
 MUTATING = {"answer_clarification", "correct_item", "log_purchase"}
+
+EXPECT_RECEIPT_TEXT = (
+    "Great, send me a photo of the receipt 📸 and I'll log it. "
+    "Lay it flat with the whole receipt in the frame.\n"
+    "No photo? Type it out instead, e.g. \"bought 2 crates of eggs for 4500 at Shoprite\"."
+)
 
 HELP_TEXT = (
     "Here's what I can do:\n"
@@ -158,12 +167,19 @@ class SpendingQuery(BaseModel):
     end: Optional[str] = None
     category: Optional[str] = None
     item: Optional[str] = None
+    item_terms: list[str] = []
+
+    @field_validator("item_terms", mode="before")
+    @classmethod
+    def _terms(cls, v):
+        return [str(x) for x in v if str(x).strip()] if isinstance(v, list) else []
 
 
 class RouterDecision(BaseModel):
     intent: str = "unclear"
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     item_number: Optional[int] = None
+    item_name: Optional[str] = None  # correct_item by name, when the number isn't known
     verdict: Optional[str] = None  # answer_clarification: "correct" | "fix"
     patch: Optional[Patch] = None
     purchase: Optional[Purchase] = None
@@ -215,13 +231,14 @@ Return ONLY a JSON object:
   "intent": one of %(intents)s,
   "confidence": 0.0-1.0,            // how sure you are of the intent AND the details
   "item_number": integer | null,    // the "item N" the message refers to
+  "item_name": str | null,          // correct_item: the item's name as they wrote it
   "verdict": "correct" | "fix" | null,   // answer_clarification only
   "patch": {"name": str|null, "price": number|null, "category": str|null} | null,
   "purchase": {"vendor": str|null, "date": "YYYY-MM-DD"|null,
                "items": [{"name": str, "quantity": number, "total_price": number|null}]} | null,
   "query": {"scope": "me"|"family", "period": %(periods)s,
             "start": "YYYY-MM-DD"|null, "end": "YYYY-MM-DD"|null,
-            "category": str|null, "item": str|null} | null,
+            "category": str|null, "item": str|null, "item_terms": [str]} | null,
   "reply": str | null,              // only for smalltalk / unclear: a short friendly reply
   "remember": [str],                // durable facts worth keeping (see below), usually []
   "reasoning": str                  // one short sentence, for debugging
@@ -234,9 +251,15 @@ was 1500"). verdict "correct" = the item is right as shown; verdict "fix" = they
 gave a corrected value (put it in patch). Set item_number to the item they mean. \
 If several clarifications are open and the message doesn't say which item, \
 leave item_number null — do NOT guess.
-- correct_item: changing an item on an EXISTING logged receipt (usually LAST \
-RECEIPT) — "item 2 price was 2500", "the milk should be Groceries". You may map an \
-item name to its item_number using LAST RECEIPT. patch holds only the fields they changed.
+- correct_item: changing an item on an EXISTING logged receipt — "item 2 price \
+was 2500", "the milk should be Groceries", "move Schweppes from Personal to \
+Groceries". If they give a number, set item_number. If they name the item, ALWAYS \
+set item_name to the name as they wrote it; also set item_number only if that item \
+is on LAST RECEIPT. The item may be on an older receipt — that's fine, code finds \
+it by name. patch holds only the fields they changed.
+- expect_receipt: they say they have a receipt / want to log something but \
+haven't sent it or described what they bought ("I have a receipt", "I want to log \
+something", "let me send you a receipt"). Never log_purchase without items.
 - log_purchase: describing a NEW purchase in words ("bought 2 crates of eggs for \
 4500", "paid 1500 for keke"). Numbers here are quantities and prices — never item \
 numbers, and this is never a correction. total_price is the line total \
@@ -247,7 +270,10 @@ purchase description is almost certainly log_purchase.
 EVEN WHILE a clarification is open. A question is never a clarification answer. \
 scope "family" for we/us/our/family/everyone, otherwise "me". Pick the period \
 from the words (default all_time). category must be one of CATEGORIES if it is \
-a category; for a specific product ("eggs") use item instead.
+a category; for a specific product use item, and put spellings to search \
+receipt lines for in item_terms: the singular, common variants and spacing \
+("doughnuts" -> ["doughnut", "donut", "dough nut"]; "coke" -> ["coke", \
+"coca cola"]). Receipt names are often abbreviated, so keep terms short.
 - show_last_receipt: wants to see their last receipt / logged items.
 - help: asks what the bot can do.
 - confirm_pending / cancel_pending: yes / no to STATE.pending_action. Only use \
@@ -354,36 +380,52 @@ class ConversationAgent:
 
     # ---------------- context ----------------
     def _build_context(self, member: Member) -> dict:
-        categories = self.store.list_categories()
-        cat_by_id = {c.id: c for c in categories}
+        """Everything the router and the checks need, fetched in parallel.
 
-        open_entries: list[dict] = []
-        for cl in self.store.list_open_clarifications_for_member(member.id):
-            receipt = self.store.get_receipt(cl.receipt_id)
-            li = self.store.get_line_item(cl.line_item_id) if cl.line_item_id else None
-            open_entries.append({
-                "clarification": cl,
-                "receipt": receipt,
-                "line_item": li,
-                "item_number": li.position if li else None,
-                "vendor": (receipt.vendor if receipt else None) or "the receipt",
-            })
+        Each read is a separate Supabase round trip (~0.35s from Lagos), so
+        running them side by side instead of one after another is most of the
+        time saved before the bot can start "thinking" (changelog v1.7).
+        """
+        def open_entries() -> list[dict]:
+            cls = self.store.list_open_clarifications_for_member(member.id)
+            if not cls:
+                return []
 
-        my_receipts = [
-            r for r in self.store.list_receipts(family_id=member.family_id) if r.member_id == member.id
-        ]
-        last_receipt = my_receipts[0] if my_receipts else None
-        last_items = self.store.list_line_items(last_receipt.id) if last_receipt else []
+            def entry(cl) -> dict:
+                receipt = self.store.get_receipt(cl.receipt_id)
+                li = self.store.get_line_item(cl.line_item_id) if cl.line_item_id else None
+                return {
+                    "clarification": cl,
+                    "receipt": receipt,
+                    "line_item": li,
+                    "item_number": li.position if li else None,
+                    "vendor": (receipt.vendor if receipt else None) or "the receipt",
+                }
+            return run_parallel({i: (lambda cl=cl: entry(cl)) for i, cl in enumerate(cls)}).values()
 
+        def last_receipt():
+            r = self.store.latest_receipt_for_member(member.id)
+            return r, (self.store.list_line_items(r.id) if r else [])
+
+        got = run_parallel({
+            "categories": self.store.list_categories,
+            "open": lambda: list(open_entries()),
+            "last": last_receipt,
+            "state": lambda: self.memory.state(member.id),
+            "recent": lambda: self.memory.recent(member.id),
+            "long_term": lambda: self.memory.long_term(member.id),
+        })
+        categories = got["categories"]
+        last_receipt_row, last_items = got["last"]
         return {
             "categories": categories,
-            "cat_by_id": cat_by_id,
-            "open": open_entries,
-            "last_receipt": last_receipt,
+            "cat_by_id": {c.id: c for c in categories},
+            "open": got["open"],
+            "last_receipt": last_receipt_row,
             "last_items": last_items,
-            "state": self.memory.state(member.id),
-            "recent": self.memory.recent(member.id),
-            "long_term": self.memory.long_term(member.id),
+            "state": got["state"],
+            "recent": got["recent"],
+            "long_term": got["long_term"],
         }
 
     def _context_for_prompt(self, ctx: dict) -> str:
@@ -478,6 +520,7 @@ class ConversationAgent:
             "log_purchase": self._do_log_purchase,
             "spending_question": self._do_spending_question,
             "show_last_receipt": self._do_show_last_receipt,
+            "expect_receipt": lambda m, t, d, c: EXPECT_RECEIPT_TEXT,
             "help": lambda m, t, d, c: HELP_TEXT,
             "confirm_pending": self._do_confirm_pending,
             "cancel_pending": self._do_cancel_pending,
@@ -497,7 +540,9 @@ class ConversationAgent:
             reply = handler(member, text, d, ctx)
 
         if d.intent not in MUTATING and d.intent not in ("confirm_pending", "cancel_pending"):
-            reply = self._with_open_reminder(member, reply)
+            # Non-changing intents leave clarifications as they were, so the
+            # context we already loaded is current: no extra round trip.
+            reply = self._with_open_reminder(ctx["open"], reply)
         return reply
 
     # -- confidence gate ------------------------------------------------
@@ -588,10 +633,15 @@ class ConversationAgent:
 
     # -- correct an item on an existing receipt (bug 1 + 3) -------------
     def _do_correct_item(self, member: Member, text: str, d: RouterDecision, ctx: dict) -> str:
-        if d.item_number is None:
-            return "Which item should I change? e.g. 'item 2 price was 2500'."
+        if d.item_number is None and not d.item_name:
+            return "Which item should I change? e.g. 'item 2 price was 2500' or 'the milk should be Groceries'."
         if d.patch is None or d.patch.is_empty():
-            return f"What should item {d.item_number} be? e.g. 'item {d.item_number} price was 2500'."
+            what = f"item {d.item_number}" if d.item_number is not None else f"'{d.item_name}'"
+            return f"What should {what} be? e.g. 'item 2 price was 2500' or 'the milk should be Groceries'."
+        if d.item_number is None or not self._names_item_on_last_receipt(d, ctx):
+            # Named an item that isn't the numbered one on the last receipt (often on an
+            # older receipt, where every item may even be "item 1"): find it by name.
+            return self._correct_item_by_name(member, d, ctx)
 
         # Bug 3: if this item is one we're asking about, it's that clarification's answer.
         open_matches = [e for e in ctx["open"] if e["item_number"] == d.item_number]
@@ -623,6 +673,78 @@ class ConversationAgent:
         if receipt.status == ReceiptStatus.NEEDS_REVIEW:
             return self._finish_receipt(receipt.id, head)
         return head
+
+    def _names_item_on_last_receipt(self, d: RouterDecision, ctx: dict) -> bool:
+        li = next((i for i in ctx["last_items"] if i.position == d.item_number), None)
+        if li is None:
+            return not d.item_name  # a bare "item 7" that doesn't exist -> number path says so
+        words = item_words(d.item_name)
+        return not words or all(w in squash(li.name) for w in words)
+
+    def _correct_item_by_name(self, member: Member, d: RouterDecision, ctx: dict) -> str:
+        """Edit an item found by name on any of the member's receipts (changelog v1.7).
+
+        A category change applies to every item with that name, since it's the
+        same product bought on several receipts. A price or name change must
+        point at exactly one item, otherwise the bot lists them and asks.
+        """
+        words = item_words(d.item_name)
+        if not words:
+            return "Which item should I change? Tell me its name or its number on the receipt."
+        err = self._validate_patch(d.patch, ctx["categories"])
+        if err:
+            return err
+        matches = self.store.find_member_line_items(member.id, words)
+        if not matches:
+            return (f"I couldn't find an item called '{d.item_name}' on your receipts. "
+                    "Check the spelling, or type 'show my last receipt' to see item names.")
+
+        def where(li: LineItem, r: Receipt) -> str:
+            when = r.purchase_date or r.created_at.date()
+            return f"{li.name} {format_ngn(li.price)} · {r.vendor or 'receipt'} · {when:%d %b %Y}"
+
+        names = {squash(li.name): li.name for li, _ in matches}
+        if len(names) > 1:
+            listed = "; ".join(sorted(names.values())[:6])
+            return f"I found more than one item matching '{d.item_name}': {listed}. Which one do you mean?"
+        name = next(iter(names.values()))
+        patch = d.patch
+
+        if patch.price is not None or patch.name:
+            if len(matches) > 1:
+                listed = "\n".join(f"- {where(li, r)}" for li, r in matches[:6])
+                return (f"'{name}' is on {len(matches)} receipt lines:\n{listed}\n"
+                        "Which one should change? Tell me the vendor or date.")
+            (li, receipt), = matches
+            changes = self._describe_patch(li, patch, ctx)
+            if not changes:
+                return f"{li.name} already looks like that, so there's nothing to change."
+            if (gated := self._gate(member, d, f"update {li.name} on your {receipt.vendor or ''} "
+                                    f"receipt: " + "; ".join(changes))):
+                return gated
+            self._apply_patch(li, patch, ctx["categories"])
+            head = f"Updated {li.name} on your {receipt.vendor or 'receipt'} receipt: " + "; ".join(changes) + " ✅"
+            if receipt.status == ReceiptStatus.NEEDS_REVIEW:
+                return self._finish_receipt(receipt.id, head)
+            return head
+
+        # Category only: move every line of this product.
+        cat = self._find_category(patch.category, ctx["categories"])
+        to_move = [(li, r) for li, r in matches if li.category_id != cat.id]
+        if not to_move:
+            return f"{name} is already in {cat.name}, so there's nothing to change."
+        olds = sorted({(ctx["cat_by_id"].get(li.category_id).name if ctx["cat_by_id"].get(li.category_id)
+                        else "Other") for li, _ in to_move})
+        lines = "line" if len(to_move) == 1 else "lines"
+        if (gated := self._gate(member, d, f"move {name} ({len(to_move)} receipt {lines}) "
+                                f"from {', '.join(olds)} to {cat.name}")):
+            return gated
+        for li, _ in to_move:
+            self._apply_patch(li, Patch(category=cat.name), ctx["categories"])
+        receipts = sorted({f"{r.vendor or 'receipt'} ({(r.purchase_date or r.created_at.date()):%d %b})"
+                           for _, r in to_move})
+        return (f"Moved {name} from {', '.join(olds)} to {cat.name} on {len(to_move)} receipt {lines} "
+                f"({', '.join(receipts)}) ✅\nI'll put it in {cat.name} automatically from now on.")
 
     # -- log a purchase described in words (bug 1) ----------------------
     def _do_log_purchase(self, member: Member, text: str, d: RouterDecision, ctx: dict) -> str:
@@ -671,10 +793,12 @@ class ConversationAgent:
             ))
 
         categories = ctx["categories"]
+        from app.services.capture_pipeline import _llm_categories  # lazy: capture_pipeline imports this module
+        llm_answers = _llm_categories([i.name for i in p.items if categorize_by_rules(i.name, categories) is None])
         new_items = []
         for pos, it in enumerate(p.items, start=1):
             cat, _ = categorize_item(
-                it.name, categories, llm_fallback=categorize_with_llm,
+                it.name, categories, llm_fallback=lambda name: llm_answers.get(name, "Other"),
                 persist_keywords=self.store.append_category_keywords,
             )
             new_items.append(LineItem(
@@ -693,7 +817,7 @@ class ConversationAgent:
         q = d.query or SpendingQuery()
         data = spending_snapshot(
             self.store, member, scope=q.scope, period=q.period, start=q.start, end=q.end,
-            category=q.category, item_query=q.item,
+            category=q.category, item_query=q.item, item_terms=q.item_terms,
         )
         fallback = format_snapshot(data)
         if d.source != "llm":
@@ -748,14 +872,13 @@ class ConversationAgent:
         r = self.store.get_receipt(receipt_id)
         return r.member_id if r else receipt_id
 
-    def _with_open_reminder(self, member: Member, reply: str) -> str:
+    def _with_open_reminder(self, open_entries: list[dict], reply: str) -> str:
         """Bug 2: answering something else must not swallow the open question — remind instead."""
-        open_now = self.store.list_open_clarifications_for_member(member.id)
-        if not open_now:
+        if not open_entries:
             return reply
         labels = []
-        for c in open_now[:3]:
-            li = self.store.get_line_item(c.line_item_id) if c.line_item_id else None
+        for e in open_entries[:3]:
+            li = e["line_item"]
             labels.append(f"item {li.position} ({li.name})" if li else "a receipt total")
         return f"{reply}\n\n(I'm still waiting on {', '.join(labels)} — reply 'ok N' if it's right, or correct it.)"
 
@@ -796,18 +919,22 @@ class ConversationAgent:
 
     def _apply_patch(self, li: LineItem, patch: Patch, categories: list[Category]) -> None:
         cat = self._find_category(patch.category, categories)
+        old_category_id = li.category_id  # read first: the update may change `li` in place
         self.store.update_line_item(
             li.id,
             price=patch.price,
             name=patch.name,
             category_id=cat.id if cat else None,
         )
-        if cat is not None:
+        if cat is not None and cat.id != old_category_id:
             # A human said what this item is: teach the rules table (architecture.md §7.4).
-            from app.services.categorize import _tokenize
+            # Also take these words out of the category it was wrongly put in, or the
+            # rules would keep matching them there first and repeat the mistake.
             tokens = _tokenize(patch.name or li.name)
             if tokens:
                 try:
+                    if old_category_id is not None:
+                        self.store.remove_category_keywords(old_category_id, tokens)
                     self.store.append_category_keywords(cat.id, tokens)
                 except Exception as e:
                     logger.warning("Could not reinforce keywords from correction: %s", e)
@@ -818,6 +945,24 @@ class ConversationAgent:
             [SUMMARY_PROMPT % {"previous": previous or "(none)", "turns": self._turns_text(turns)}],
             model_name=self.model, timeout=30, temperature=0.2,
         )
+
+
+_STOP_WORDS = {"the", "a", "an", "my", "our", "item", "items", "of", "on", "from", "to", "category", "price"}
+
+
+def item_words(name: Optional[str]) -> list[str]:
+    """Words that identify an item by name ("the Schweppes chapman" -> schweppes, chapman)."""
+    return [w for w in _tokenize(name or "") if w not in _STOP_WORDS and len(w) > 1]
+
+
+def run_parallel(tasks: dict) -> dict:
+    """Run zero-arg callables side by side; {key: result}. Each runs in a copy of
+    the caller's context so its Langfuse spans stay inside the message's trace."""
+    if not tasks:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
+        futures = {k: pool.submit(contextvars.copy_context().run, fn) for k, fn in tasks.items()}
+        return {k: f.result() for k, f in futures.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +1013,8 @@ def fallback_parse(text: str, ctx: dict) -> RouterDecision:
         intent = "answer_clarification" if n in open_items else "correct_item"
         return d(intent=intent, item_number=n, verdict="fix" if not patch.is_empty() else None, patch=patch)
 
+    if re.fullmatch(r"(?:i\s+)?(?:have|got|want to (?:log|send))\s+(?:a|my|the|another)?\s*receipts?[.!]*", tl):
+        return d(intent="expect_receipt")
     if re.search(r"\bhelp\b", tl) or tl in ("?", "commands"):
         return d(intent="help")
     if re.search(r"\b(show|list|see)\b", tl) and re.search(r"\b(items?|receipts?|logs?)\b", tl):
@@ -900,7 +1047,9 @@ def fallback_parse(text: str, ctx: dict) -> RouterDecision:
 def format_receipt(items: list[LineItem], categories: list[Category], receipt: Receipt) -> str:
     cat_by_id = {c.id: c for c in categories}
     verb = "Logged" if receipt.status == ReceiptStatus.CONFIRMED else "Saved"
-    lines = [f"✅ {verb} {len(items)} item(s) from {receipt.vendor or 'this receipt'}.\n"]
+    when = receipt.purchase_date
+    dated = f", dated {when:%d %b %Y}" if when else ""
+    lines = [f"✅ {verb} {len(items)} item(s) from {receipt.vendor or 'this receipt'}{dated}.\n"]
     total = Decimal("0")
     by_category: dict[str, Decimal] = {}
     for li in items:

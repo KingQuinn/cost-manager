@@ -62,12 +62,15 @@ def decision_summary(d: Any) -> dict:
     return {
         "intent": d.intent,
         "item_number": d.item_number,
+        "item_name": d.item_name,
         "verdict": d.verdict,
         "price": float(d.patch.price) if d.patch and d.patch.price is not None else None,
         "category": (d.patch.category if d.patch and d.patch.category else None)
                     or (d.query.category if d.query else None),
         "scope": d.query.scope if d.query else None,
         "period": d.query.period if d.query else None,
+        "item": d.query.item if d.query else None,
+        "item_terms": [t.lower() for t in d.query.item_terms] if d.query else [],
         "purchase_total": total,
         "remembers": bool(d.remember),
         "confidence": d.confidence,
@@ -79,6 +82,19 @@ def check(expect: dict, got: dict) -> list[str]:
     """Mismatches between expected and actual fields (empty = pass)."""
     problems = []
     for key, want in expect.items():
+        if key.endswith("_contains"):  # substring of a string field, case-insensitive
+            have = got.get(key[: -len("_contains")]) or ""
+            if want.lower() not in have.lower():
+                problems.append(f"{key}: expected to contain {want!r}, got {have!r}")
+            continue
+        if key.endswith("_include"):  # some list entry contains it ("doughnut" in ["doughnut", "donut"])
+            field = key[: -len("_include")]
+            have = list(got.get(field) or [])
+            if field == "item_terms" and got.get("item"):
+                have.append(got["item"])  # the main item word counts as a search term too
+            if not any(want.lower() in str(h).lower() for h in have):
+                problems.append(f"{key}: expected an entry containing {want!r}, got {have!r}")
+            continue
         have = got.get(key)
         if isinstance(want, str) and isinstance(have, str):
             ok = want.lower() == have.lower()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from datetime import date
 from decimal import Decimal
@@ -155,6 +156,24 @@ class DataStore(ABC):
     @abstractmethod
     def list_weekly_summaries(self, family_id: UUID) -> list[WeeklySummary]: ...
 
+    # ---- lookups for the conversation agent ---------------------------------
+    @abstractmethod
+    def latest_receipt_for_member(self, member_id: UUID) -> Optional[Receipt]:
+        """The member's most recently logged receipt (one query, no family scan)."""
+
+    @abstractmethod
+    def find_member_line_items(
+        self, member_id: UUID, words: list[str], limit: int = 50
+    ) -> list[tuple[LineItem, Receipt]]:
+        """Items on this member's receipts whose name contains every word
+        (case-insensitive), newest receipt first. Used to edit an item by name
+        when it isn't on the last receipt or its number isn't known."""
+
+    @abstractmethod
+    def remove_category_keywords(self, category_id: UUID, keywords: list[str]) -> None:
+        """Drop keywords from a category (case-insensitive). Used when a member
+        moves an item out of a category the rules table put it in."""
+
     # ---- spending questions (architecture.md §7.6) ---------------------------
     @abstractmethod
     def spending_breakdown(
@@ -165,7 +184,7 @@ class DataStore(ABC):
         start: Optional[date] = None,
         end: Optional[date] = None,
         category_id: Optional[UUID] = None,
-        item_query: Optional[str] = None,
+        item_terms: Optional[list[str]] = None,
     ) -> dict:
         """Totals for a spending question, computed by the database.
 
@@ -176,7 +195,11 @@ class DataStore(ABC):
            "by_category": [{"name", "amount"}], "by_member": [{"name", "amount"}],
            "top_vendors": [{"name", "amount", "receipts"}],
            "top_items": [{"item", "amount", "category", "vendor", "date"}],
+           "first_date", "last_date",   # purchase dates of the matching items
            "pending_receipts", "pending_amount"}
+        `item_terms` matches an item if its name contains any term once both
+        are lowercased with spaces and punctuation removed ("doughnut" matches
+        "DE PRINCE DOUGH NUT").
         Only confirmed receipts count toward totals; needs_review ones are
         reported separately (architecture.md §9).
         """
@@ -218,6 +241,13 @@ def normalize_breakdown(raw: dict) -> dict:
         "by_member": rows("by_member"),
         "top_vendors": [{**r, "receipts": int(r.get("receipts") or 0)} for r in rows("top_vendors")],
         "top_items": [{**r, "date": str(r.get("date"))} for r in rows("top_items")],
+        "first_date": str(raw["first_date"]) if raw.get("first_date") else None,
+        "last_date": str(raw["last_date"]) if raw.get("last_date") else None,
         "pending_receipts": int(raw.get("pending_receipts") or 0),
         "pending_amount": dec(raw.get("pending_amount")),
     }
+
+
+def squash(text: str) -> str:
+    """Lowercase, letters and digits only: how item names and search terms are compared."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())  # same rule as the SQL function

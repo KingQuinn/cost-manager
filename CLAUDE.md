@@ -81,7 +81,10 @@ file is a summary and pointer, not a replacement for it.
   (`conversation_turns` + `member_state`), long-term memory
   (`member_memories`). Never cache receipts, clarifications, state or
   totals. Money is never "remembered" — totals come from the
-  `spending_breakdown` SQL function on every question.
+  `spending_breakdown` SQL function (migration 0004) on every question.
+- **Gemini free tier is 15 requests/minute.** Never make one LLM call per
+  receipt item; batch (`categorize_many_with_llm`). A text message costs 1–2
+  calls.
 - **Observability is Langfuse**, optional and off without keys. Never send
   phone numbers or image bytes to it. Router eval cases live in
   `evals/intent_router_cases.json`; add a case for every new routing bug.

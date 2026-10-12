@@ -9,8 +9,8 @@ from app.config import get_settings
 from app.db import DataStore
 from app.models import Category, Clarification, LineItem, Receipt, ReceiptStatus, WhatsAppInboundMessage
 from app.services.agent import ConversationAgent, format_receipt
-from app.services.categorize import categorize_item
-from app.services.extraction import categorize_with_llm, extract_receipt
+from app.services.categorize import categorize_by_rules, categorize_item
+from app.services.extraction import categorize_many_with_llm, extract_receipt
 from app.services.memory import ConversationMemory
 from app.services.spending import format_ngn
 from app.services.whatsapp import WhatsAppClient
@@ -31,6 +31,18 @@ def mark_pending_onboard(phone: str) -> None:
 
 
 _format_ngn = format_ngn  # kept for older imports
+
+
+def _llm_categories(names: list[str]) -> dict[str, str]:
+    """Categories for items the rules missed. If Gemini fails they become "Other"
+    (members can move them later), so a receipt is never dropped."""
+    if not names:
+        return {}
+    try:
+        return categorize_many_with_llm(names)
+    except Exception as e:
+        logger.warning("Batch categorization failed for %d item(s), using Other: %s", len(names), e)
+        return {n: "Other" for n in names}
 
 
 class CapturePipeline:
@@ -119,10 +131,16 @@ class CapturePipeline:
         low_conf_extracted_items_for_question: list[tuple[int, LineItem, str]] = []
         # index (1-based) used in chat UX
 
+        # Items the keyword rules can't place go to Gemini together in ONE call
+        # (v1.6 made one call per item: 14 calls / ~18s on a 35-item receipt).
+        # Then categorize in order, so the rules learn from each answer as before.
+        unmatched = [e.name for e in extraction.line_items if categorize_by_rules(e.name, categories) is None]
+        llm_answers = _llm_categories(unmatched)
+
         for idx, ext in enumerate(extraction.line_items, start=1):
             cat, _used_llm = categorize_item(
                 ext.name, categories,
-                llm_fallback=categorize_with_llm,
+                llm_fallback=lambda name: llm_answers.get(name, "Other"),
                 persist_keywords=self.store.append_category_keywords,
             )
             li = LineItem(

@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from app.db.base import DataStore, normalize_breakdown
+from app.db.base import DataStore, normalize_breakdown, squash
 from app.models import (
     Category,
     Clarification,
@@ -217,19 +217,16 @@ class SupabaseStore(DataStore):
         return Clarification(**r.data[0]) if r.data else None
 
     def list_open_clarifications_for_member(self, member_id: UUID) -> list[Clarification]:
-        r_receipts = self._client.table("receipts").select("id").eq("member_id", str(member_id)).execute()
-        receipt_ids = [row["id"] for row in r_receipts.data]
-        if not receipt_ids:
-            return []
+        # One round trip: filter through the receipt join instead of fetching ids first.
         r = (
             self._client.table("clarifications")
-            .select("*")
-            .in_("receipt_id", receipt_ids)
+            .select("*, receipts!inner(member_id)")
+            .eq("receipts.member_id", str(member_id))
             .eq("resolved", False)
             .order("created_at")
             .execute()
         )
-        return [Clarification(**row) for row in r.data]
+        return [Clarification(**{k: v for k, v in row.items() if k != "receipts"}) for row in r.data]
 
     def resolve_clarification(self, clarification_id: UUID, answer: str) -> Clarification:
         r = (
@@ -299,6 +296,49 @@ class SupabaseStore(DataStore):
     def delete_member_memory(self, memory_id: UUID) -> None:
         self._client.table("member_memories").delete().eq("id", str(memory_id)).execute()
 
+    # ---------- lookups for the conversation agent ----------
+    def latest_receipt_for_member(self, member_id: UUID) -> Optional[Receipt]:
+        r = (
+            self._client.table("receipts").select("*").eq("member_id", str(member_id))
+            .order("created_at", desc=True).limit(1).execute()
+        )
+        return Receipt(**r.data[0]) if r.data else None
+
+    def find_member_line_items(
+        self, member_id: UUID, words: list[str], limit: int = 50
+    ) -> list[tuple[LineItem, Receipt]]:
+        want = [w for w in (squash(x) for x in words) if w]
+        if not want:
+            return []
+        # One round trip: items joined to their receipt, filtered to this member and
+        # narrowed in SQL by the start of the longest word (so "doughnut" still
+        # finds "DOUGH NUT"); the exact squashed all-words check runs here.
+        prefix = max(want, key=len)[:4]
+        r = (
+            self._client.table("line_items")
+            .select("*, receipts!inner(*)")
+            .eq("receipts.member_id", str(member_id))
+            .ilike("name", f"%{prefix}%")
+            .limit(500)
+            .execute()
+        )
+        out = []
+        for row in r.data:
+            receipt = Receipt(**row.pop("receipts"))
+            li = LineItem(**row)
+            if all(w in squash(li.name) for w in want):
+                out.append((li, receipt))
+        out.sort(key=lambda pair: (pair[1].created_at, -pair[0].position), reverse=True)
+        return out[:limit]
+
+    def remove_category_keywords(self, category_id: UUID, keywords: list[str]) -> None:
+        cur = self._client.table("categories").select("keywords").eq("id", str(category_id)).single().execute()
+        existing = list(cur.data.get("keywords") or [])
+        drop = {k.lower() for k in keywords}
+        kept = [k for k in existing if k.lower() not in drop]
+        if len(kept) != len(existing):
+            self._client.table("categories").update({"keywords": kept}).eq("id", str(category_id)).execute()
+
     # ---------- spending questions ----------
     def spending_breakdown(
         self,
@@ -308,16 +348,17 @@ class SupabaseStore(DataStore):
         start: Optional[date] = None,
         end: Optional[date] = None,
         category_id: Optional[UUID] = None,
-        item_query: Optional[str] = None,
+        item_terms: Optional[list[str]] = None,
     ) -> dict:
-        # One round trip; the SQL function does all the summing (migrations/0003).
+        # One round trip; the SQL function does all the summing (migrations/0004).
+        terms = [t for t in (squash(x) for x in item_terms or []) if t]
         r = self._client.rpc("spending_breakdown", {
             "p_family_id": str(family_id),
             "p_member_id": str(member_id) if member_id else None,
             "p_start": start.isoformat() if start else None,
             "p_end": end.isoformat() if end else None,
             "p_category_id": str(category_id) if category_id else None,
-            "p_item": item_query or None,
+            "p_items": terms or None,
         }).execute()
         return normalize_breakdown(r.data or {})
 
