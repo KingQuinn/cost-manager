@@ -51,7 +51,10 @@ explain in extraction_notes.
 _CATEGORY_PROMPT_TEMPLATE = """\
 You are a categorizer for a family expense tracker. Given the name of a single \
 purchase line item, assign it to exactly one category from this list: \
-{category_list}. Respond with ONLY the category name, nothing else.
+{category_list}. Drinks means ready-to-drink beverages (water, soft drinks, juice, malt, \
+energy drinks, bottled tea, beer, wine, zobo, kunu, fura drink). Things you \
+cook with or prepare a drink from (milk, tea bags, coffee, Milo powder) are \
+Groceries. Respond with ONLY the category name, nothing else.
 
 Line item name: "{item_name}"
 """
@@ -60,7 +63,10 @@ Line item name: "{item_name}"
 _BATCH_CATEGORY_PROMPT_TEMPLATE = """\
 You are a categorizer for a family expense tracker in Nigeria. Assign each \
 purchase line item below to exactly one category from this list: \
-{category_list}. Receipt names are often abbreviated or misspelled.
+{category_list}. Receipt names are often abbreviated or misspelled. Drinks means ready-to-drink beverages (water, soft drinks, juice, malt, \
+energy drinks, bottled tea, beer, wine, zobo, kunu, fura drink). Things you \
+cook with or prepare a drink from (milk, tea bags, coffee, Milo powder) are \
+Groceries.
 
 Return ONLY a JSON object mapping each item name, copied exactly, to its category name.
 

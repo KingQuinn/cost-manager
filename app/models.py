@@ -55,8 +55,22 @@ class Category(BaseModel):
     keywords: list[str] = []
 
 
+# Keywords match the START of a word in an item name ("cola" matches "AMERICAN
+# COLA" but not "CHOCOLATE"); the longest matching keyword wins (categorize.py).
+# Drinks (v1.8) = ready-to-drink beverages. Things you prepare a drink from
+# (milk, tea bags, coffee, Milo powder) stay in Groceries.
+DRINK_KEYWORDS = [
+    "drink", "juice", "cola", "coke", "fanta", "sprite", "pepsi", "7up", "mirinda",
+    "maltina", "malta", "schweppes", "chapman", "zobo", "kunu", "fura", "lucozade",
+    "aquafina", "h2o", "h20", "table water", "bottled water", "eva water", "pure life",
+    "ice tea", "iced tea", "5alive", "chivita", "capri", "smoothie", "milkshake", "yoghurt drink",
+    "beer", "lager", "stout", "guinness", "heineken", "trophy", "wine", "vodka", "whisky",
+    "red bull", "energy drink", "predator", "power horse", "bigi", "la casera", "soda", "tonic water",
+]
+
 DEFAULT_CATEGORIES: list[tuple[str, list[str]]] = [
     ("Groceries", ["rice","garri","beans","tomato","pepper","onion","yam","shoprite","market"]),
+    ("Drinks", DRINK_KEYWORDS),
     ("Transport", ["uber","bolt","keke","fuel","petrol","diesel","fare"]),
     ("Household", ["detergent","tissue","cleaning","bulb","omo","soap"]),
     ("Utilities", ["electricity","nepa","data","airtime","internet","dstv"]),

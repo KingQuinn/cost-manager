@@ -244,6 +244,33 @@
    "expect": {
     "intent": "expect_receipt"
    }
+  },
+  {
+   "id": "v18-drinks-spend",
+   "tags": [
+    "v1.8"
+   ],
+   "household": "confirmed",
+   "message": "how much have we spent on drinks this month?",
+   "expect": {
+    "intent": "spending_question",
+    "scope": "family",
+    "period": "this_month",
+    "category": "Drinks"
+   }
+  },
+  {
+   "id": "v18-move-to-drinks",
+   "tags": [
+    "v1.8"
+   ],
+   "household": "confirmed",
+   "message": "the lipton ice tea should be under drinks",
+   "expect": {
+    "intent": "correct_item",
+    "item_name_contains": "lipton",
+    "category": "Drinks"
+   }
   }
  ]
 }

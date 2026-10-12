@@ -54,7 +54,7 @@ from app.models import (
 )
 from app.services import llm
 from app.db.base import squash
-from app.services.categorize import _tokenize, categorize_by_rules, categorize_item
+from app.services.categorize import _tokenize, categorize_by_rules, categorize_item, keyword_tokens
 from app.services.memory import ConversationMemory
 from app.services.spending import (
     amounts_in,
@@ -932,7 +932,7 @@ class ConversationAgent:
             # A human said what this item is: teach the rules table (architecture.md §7.4).
             # Also take these words out of the category it was wrongly put in, or the
             # rules would keep matching them there first and repeat the mistake.
-            tokens = _tokenize(patch.name or li.name)
+            tokens = keyword_tokens(patch.name or li.name)
             if tokens:
                 try:
                     if old_category_id is not None:
